@@ -772,6 +772,19 @@ int sched_setattr_nocheck(struct task_struct *p, const struct sched_attr *attr)
 }
 EXPORT_SYMBOL_GPL(sched_setattr_nocheck);
 
+/*
+ * Like sched_setattr_nocheck(), but lets the caller choose @pi. A caller that
+ * changes a task's scheduling parameters from a context where the priority-
+ * inheritance machinery is not usable -- e.g. interrupt context -- needs
+ * pi=false.
+ */
+int sched_setattr_pi_nocheck(struct task_struct *p, const struct sched_attr *attr,
+			     bool pi)
+{
+	return __sched_setscheduler(p, attr, false, pi);
+}
+EXPORT_SYMBOL_GPL(sched_setattr_pi_nocheck);
+
 /**
  * sched_setscheduler_nocheck - change the scheduling policy and/or RT priority of a thread from kernel-space.
  * @p: the task in question.
