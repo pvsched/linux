@@ -30,6 +30,7 @@
 #include <linux/miscdevice.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/pid.h>
 #include <linux/pvsched.h>
@@ -53,12 +54,14 @@
 #include <uapi/linux/pvsched.h>
 
 /*
- * DoS cap tunables, in nanoseconds. A boost may last at most
- * @pvsched_max_boost_ns; a task that exceeds it is forced back to baseline and
- * may not be re-boosted for @pvsched_throttle_ns.
+ * DoS cap tunables, in nanoseconds (see /sys/module/pvsched/parameters/). A
+ * boost may last at most @pvsched_max_boost_ns; a task that exceeds it is forced
+ * back to baseline and may not be re-boosted for @pvsched_throttle_ns.
  */
 static unsigned long pvsched_max_boost_ns = NSEC_PER_SEC;
 static unsigned long pvsched_throttle_ns  = NSEC_PER_SEC;
+module_param(pvsched_max_boost_ns, ulong, 0644);
+module_param(pvsched_throttle_ns, ulong, 0644);
 
 /* Per-task state: a hash keyed by task_struct *. */
 
