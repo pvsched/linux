@@ -20,3 +20,4 @@ KVM
    vcpu-requests
    halt-polling
    review-checklist
+   pvsched-v3
