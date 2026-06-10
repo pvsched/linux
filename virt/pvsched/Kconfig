@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config PARAVIRT_SCHED_HOST
+	tristate "Paravirt scheduling host framework"
+	depends on KVM
+	help
+	  Paravirtualized scheduling lets the host and a guest exchange
+	  scheduling information through a shared memory region, so the
+	  hypervisor can schedule vCPU threads more effectively -- for
+	  example, boosting the priority of a vCPU thread while the guest
+	  runs a latency-sensitive workload on it.
+
+	  This option enables the host side framework, which attaches to KVM's
+	  vCPU scheduling tracepoints and dispatches their events to a policy.
+	  The policy itself is supplied as a kernel module or a BPF program.
+	  Built as a module (pvsched), which depends on KVM.
+
+	  If unsure, say N.
+
