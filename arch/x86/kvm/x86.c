@@ -11422,6 +11422,16 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 		goto cancel_injection;
 	}
 
+	/*
+	 * Past the final bail-out: the VM-entry below will run. Notify pvsched
+	 * here so the policy publishes its shared memory exactly once, right
+	 * before the guest runs; an aborted entry attempt must not run the
+	 * policy (and e.g. consume pending state the guest would never see).
+	 */
+#if IS_ENABLED(CONFIG_PARAVIRT_SCHED_HOST)
+	trace_kvm_pvsched_vmentry_tp(vcpu);
+#endif
+
 	run_flags = 0;
 	if (req_immediate_exit) {
 		run_flags |= KVM_RUN_FORCE_IMMEDIATE_EXIT;
@@ -11582,6 +11592,11 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 	guest_timing_exit_irqoff();
 
 	local_irq_enable();
+
+#if IS_ENABLED(CONFIG_PARAVIRT_SCHED_HOST)
+	trace_kvm_pvsched_vmexit_tp(vcpu);
+#endif
+
 	preempt_enable();
 
 	kvm_vcpu_srcu_read_lock(vcpu);

@@ -41,6 +41,7 @@
 #include "irq.h"
 #include "ioapic.h"
 #include "trace.h"
+#include <trace/events/kvm.h>
 #include "x86.h"
 #include "xen.h"
 #include "cpuid.h"
@@ -1489,6 +1490,17 @@ static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
 		       delivery_mode);
 		break;
 	}
+
+	/*
+	 * Runs in the injector's context (the target vCPU is usually not
+	 * current and IRQs may be disabled): a probe here must not block or
+	 * wake current.
+	 */
+#if IS_ENABLED(CONFIG_PARAVIRT_SCHED_HOST)
+	if (result)
+		trace_kvm_pvsched_vcpu_inject_intr_tp(vcpu);
+#endif
+
 	return result;
 }
 

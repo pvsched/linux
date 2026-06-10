@@ -62,6 +62,44 @@ TRACE_EVENT(kvm_vcpu_wakeup,
 		  __entry->valid ? "valid" : "invalid")
 );
 
+/*
+ * Paravirt scheduling (pvsched) vCPU events.
+ *
+ * These are bare tracepoints (DECLARE_TRACE), deliberately NOT exposed in
+ * tracefs: they are an internal attach point for a host pvsched policy -- a
+ * BPF tp_btf program or an in-kernel module -- not a user-facing tracing
+ * interface. Each passes the struct kvm_vcpu so a consumer can read its state
+ * and adjust the vCPU thread's priority. A BPF program attaches via
+ * tp_btf/<name>_tp (e.g. tp_btf/kvm_pvsched_vmentry_tp). This mirrors the
+ * scheduler's own pelt and sched bare tracepoints.
+ */
+
+/*
+ * Only built when the pvsched host framework is configured -- KVM carries no
+ * pvsched tracepoint code otherwise.
+ */
+#if IS_ENABLED(CONFIG_PARAVIRT_SCHED_HOST)
+/* About to enter the guest (boost/throttle accounting point). */
+DECLARE_TRACE(kvm_pvsched_vmentry,
+	TP_PROTO(struct kvm_vcpu *vcpu),
+	TP_ARGS(vcpu));
+
+/* Just left the guest (apply the guest-requested scheduling parameters). */
+DECLARE_TRACE(kvm_pvsched_vmexit,
+	TP_PROTO(struct kvm_vcpu *vcpu),
+	TP_ARGS(vcpu));
+
+/* About to block; will be woken only by latency-sensitive events. */
+DECLARE_TRACE(kvm_pvsched_vcpu_halt,
+	TP_PROTO(struct kvm_vcpu *vcpu),
+	TP_ARGS(vcpu));
+
+/* An interrupt was accepted for the vCPU; it should run to deliver it. */
+DECLARE_TRACE(kvm_pvsched_vcpu_inject_intr,
+	TP_PROTO(struct kvm_vcpu *vcpu),
+	TP_ARGS(vcpu));
+#endif /* CONFIG_PARAVIRT_SCHED_HOST */
+
 #if defined(CONFIG_HAVE_KVM_IRQCHIP)
 TRACE_EVENT(kvm_set_irq,
 	TP_PROTO(unsigned int gsi, int level, int irq_source_id),

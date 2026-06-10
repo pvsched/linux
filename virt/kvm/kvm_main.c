@@ -64,6 +64,14 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/kvm.h>
 
+#if IS_ENABLED(CONFIG_PARAVIRT_SCHED_HOST)
+/* Exported so the pvsched host module can attach to these from kvm */
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_pvsched_vmentry_tp);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_pvsched_vmexit_tp);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_pvsched_vcpu_halt_tp);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_pvsched_vcpu_inject_intr_tp);
+#endif
+
 #include <linux/kvm_dirty_ring.h>
 
 
@@ -3657,6 +3665,14 @@ bool kvm_vcpu_block(struct kvm_vcpu *vcpu)
 
 		if (kvm_vcpu_check_block(vcpu) < 0)
 			break;
+
+		/*
+		 * Runs between set_current_state(TASK_INTERRUPTIBLE) and
+		 * schedule(): a probe here must not block or wake current.
+		 */
+#if IS_ENABLED(CONFIG_PARAVIRT_SCHED_HOST)
+		trace_kvm_pvsched_vcpu_halt_tp(vcpu);
+#endif
 
 		waited = true;
 		schedule();
