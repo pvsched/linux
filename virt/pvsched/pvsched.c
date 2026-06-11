@@ -13,6 +13,7 @@
 
 #define pr_fmt(fmt) "pvsched: " fmt
 
+#include <linux/atomic.h>
 #include <linux/bpf.h>
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
@@ -20,6 +21,7 @@
 #include <linux/capability.h>
 #include <linux/debugfs.h>
 #include <linux/hashtable.h>
+#include <linux/hrtimer.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/kvm_host.h>
@@ -51,14 +53,32 @@
 #include <uapi/linux/pvsched.h>
 
 /*
+ * DoS cap tunables, in nanoseconds. A boost may last at most
+ * @pvsched_max_boost_ns; a task that exceeds it is forced back to baseline and
+ * may not be re-boosted for @pvsched_throttle_ns.
+ */
+static unsigned long pvsched_max_boost_ns = NSEC_PER_SEC;
+static unsigned long pvsched_throttle_ns  = NSEC_PER_SEC;
+
+/* Per-task state: a hash keyed by task_struct *. */
+
+enum pvsched_state {
+	PVSCHED_NONE = 0,	/* not boosted */
+	PVSCHED_BOOSTED,	/* boosted; cap timer armed */
+	PVSCHED_THROTTLED,	/* capped; in cooldown, boosts refused */
+};
+
+/*
  * Per-task pvsched state. Created on first use (vCPU registration) and removed
  * when the task exits (the sched_process_exit probe) or the module unloads.
- * Holds a reference on @task so the pointer is always valid (module teardown
- * dereferences it).
+ * Holds a reference on @task so the pointer is always valid (the cap timer and
+ * module teardown dereferences it).
  */
 struct pvsched_task {
 	struct hlist_node		hash;	/* pvsched_ht linkage (RCU) */
 	struct task_struct		*task;	/* key; a ref is held */
+	struct hrtimer			timer;
+	atomic_t			state;
 	const struct pvsched_policy_ops	*policy; /* policy bound to vCPU */
 	struct page			*shm_page;	/* pinned shared page, or NULL */
 	union pvsched_vcpu_page		*shm;		/* its kernel mapping */
@@ -81,6 +101,9 @@ static struct pvsched_task *pvsched_task_find(struct task_struct *t)
 	return NULL;
 }
 
+static enum hrtimer_restart pvsched_cap_timer(struct hrtimer *timer);
+static void pvsched_set_baseline(struct task_struct *p);
+
 /*
  * Allocate an unlinked per-task state (sleepable; only the registration ioctl
  * creates entries). Takes a reference on @t that the entry owns.
@@ -90,6 +113,9 @@ static struct pvsched_task *pvsched_task_alloc(struct task_struct *t)
 	struct pvsched_task *pt = kzalloc(sizeof(*pt), GFP_KERNEL);
 
 	if (pt) {
+		hrtimer_setup(&pt->timer, pvsched_cap_timer, CLOCK_MONOTONIC,
+			      HRTIMER_MODE_REL_HARD);
+		atomic_set(&pt->state, PVSCHED_NONE);
 		pt->task = t;
 		get_task_struct(t);
 	}
@@ -129,11 +155,17 @@ static void pvsched_teardown_fn(struct work_struct *w)
 	if (!batch)
 		return;
 
-	/* One grace period covers all in-flight dispatch readers. */
+	/*
+	 * One grace period covers all in-flight dispatch readers. The entries
+	 * were unhashed before being queued here, so after it nothing can find
+	 * them and no new boost can arm a cap timer: the cancel below is final.
+	 */
 	synchronize_rcu();
 
-	llist_for_each_entry_safe(pt, n, batch, teardown)
+	llist_for_each_entry_safe(pt, n, batch, teardown) {
+		hrtimer_cancel(&pt->timer);
 		pvsched_task_free(pt);
+	}
 }
 static DECLARE_WORK(pvsched_teardown_work, pvsched_teardown_fn);
 
@@ -156,6 +188,74 @@ static void pvsched_sched_exit_probe(void *data, struct task_struct *t,
 	}
 }
 
+/*
+ * Force a task back to baseline. Baseline is hardcoded SCHED_NORMAL / nice 0,
+ * which is right when the VMM runs vCPU threads at default priority (the common
+ * case): restoring NORMAL/0 restores their true baseline, and it self-heals a
+ * boost left stuck by a crashed or unloaded session. A vCPU the VMM placed at a
+ * non-default policy/nice is reset to default here on throttle/unregister.
+ *
+ * TODO: Before upstream: snapshot the thread's sched params at registration and
+ * restore those instead of a fixed baseline (v2 carried baseline handling of
+ * this kind -- recover it from the v2 PoC).
+ */
+static void pvsched_set_baseline(struct task_struct *p)
+{
+	struct sched_attr attr = {
+		.size		= sizeof(attr),
+		.sched_policy	= SCHED_NORMAL,
+	};
+
+	sched_setattr_pi_nocheck(p, &attr, false);
+}
+
+/*
+ * Cap timer, run in hard IRQ context so it cannot be starved by the boosted
+ * task itself. First expiry (BOOSTED): the boost outlived its budget, force the
+ * task to baseline and re-arm for the throttle cooldown. Second expiry
+ * (THROTTLED): cooldown elapsed, allow boosting again. Both transitions are
+ * cmpxchg, so a concurrent deboost simply wins and this becomes a no-op.
+ */
+static enum hrtimer_restart pvsched_cap_timer(struct hrtimer *timer)
+{
+	struct pvsched_task *pt = container_of(timer, struct pvsched_task, timer);
+
+	switch (atomic_cmpxchg(&pt->state, PVSCHED_BOOSTED, PVSCHED_THROTTLED)) {
+	case PVSCHED_BOOSTED:
+		pvsched_set_baseline(pt->task);
+		hrtimer_forward_now(timer, ns_to_ktime(pvsched_throttle_ns));
+		return HRTIMER_RESTART;
+	case PVSCHED_THROTTLED:
+		/* Cooldown expiry; only this timer clears THROTTLED. */
+		WARN_ON_ONCE(atomic_cmpxchg(&pt->state, PVSCHED_THROTTLED,
+					    PVSCHED_NONE) != PVSCHED_THROTTLED);
+		break;
+	default:
+		/* NONE: a concurrent deboost won the first expiry's race. */
+		break;
+	}
+	return HRTIMER_NORESTART;
+}
+
+/*
+ * A request is a "boost" (subject to the cap) if it raises priority above
+ * baseline: any RT policy, or a fair policy with negative nice. nice is already
+ * clamped to [MIN_NICE, MAX_NICE] by the caller.
+ */
+static bool pvsched_is_boost(u32 policy, s32 nice)
+{
+	switch (policy) {
+	case SCHED_FIFO:
+	case SCHED_RR:
+		return true;
+	case SCHED_NORMAL:
+	case SCHED_BATCH:
+		return nice < 0;
+	default:
+		return false;
+	}
+}
+
 /**
  * pvsched_set_params - set a vCPU thread's scheduling parameters
  * @pid: pid of the vCPU thread, in the caller's pid namespace
@@ -166,11 +266,11 @@ static void pvsched_sched_exit_probe(void *data, struct task_struct *t,
  * Called from a pvsched policy's callbacks: exported for policy modules, and
  * registered as a kfunc for BPF policies. The change is applied with pi=false
  * so it is safe from the interrupt context of the injection event; SCHED_DEADLINE
- * is rejected because its setup can sleep. Only a registered vCPU thread may be
- * targeted.
+ * is rejected because its setup can sleep. A boost (an RT policy, or a fair
+ * policy with negative nice) is bounded by the per-task cap.
  *
- * Return: 0 if applied, or a negative error (-ESRCH, -EOPNOTSUPP, -EINVAL, or a
- * scheduler error).
+ * Return: 0 if applied; 1 if throttled (held at baseline, boost refused); or a
+ * negative error (-ESRCH, -EOPNOTSUPP, -EINVAL, -ENOMEM, or a scheduler error).
  */
 __bpf_kfunc int pvsched_set_params(s32 pid, u32 policy, s32 nice, u32 rt_prio)
 {
@@ -181,6 +281,7 @@ __bpf_kfunc int pvsched_set_params(s32 pid, u32 policy, s32 nice, u32 rt_prio)
 	};
 	struct task_struct *p;
 	struct pvsched_task *pt;
+	bool boost;
 	int ret;
 
 	switch (policy) {
@@ -203,6 +304,8 @@ __bpf_kfunc int pvsched_set_params(s32 pid, u32 policy, s32 nice, u32 rt_prio)
 	if (!p)
 		return -ESRCH;
 
+	boost = pvsched_is_boost(policy, attr.sched_nice);
+
 	/*
 	 * The rcu_read_lock() pins the entry across use (a free waits out a
 	 * grace period after unhashing). No entry: not a vCPU we track.
@@ -214,7 +317,49 @@ __bpf_kfunc int pvsched_set_params(s32 pid, u32 policy, s32 nice, u32 rt_prio)
 		goto out;
 	}
 
-	ret = sched_setattr_pi_nocheck(p, &attr, false);
+	if (boost) {
+		if (atomic_read(&pt->state) == PVSCHED_THROTTLED) {
+			pvsched_set_baseline(p);
+			ret = 1;
+			goto out;
+		}
+		ret = sched_setattr_pi_nocheck(p, &attr, false);
+		/*
+		 * Apply-then-claim. The boost is applied above; now claim the cap
+		 * state to decide what it meant. This block must stay AFTER the
+		 * apply: on a lost race its set_baseline() has to be the last write
+		 * to the task's priority.
+		 *   NONE      first boost -- arm the cap timer.
+		 *   THROTTLED the cap timer threw us out between the check above and
+		 *             here -- undo the boost we just applied.
+		 *   BOOSTED   already capped (a re-boost) -- nothing to do; a
+		 *             concurrent throttle's set_baseline() is ordered after
+		 *             our apply by the cmpxchg barrier, so it still wins.
+		 */
+		if (!ret) {
+			switch (atomic_cmpxchg(&pt->state, PVSCHED_NONE,
+					       PVSCHED_BOOSTED)) {
+			case PVSCHED_NONE:
+				hrtimer_start(&pt->timer,
+					      ns_to_ktime(pvsched_max_boost_ns),
+					      HRTIMER_MODE_REL_HARD);
+				break;
+			case PVSCHED_THROTTLED:
+				pvsched_set_baseline(p);
+				ret = 1;
+				break;
+			}
+		}
+	} else {
+		/*
+		 * Claim BOOSTED -> NONE before applying, so a cap timer firing
+		 * concurrently loses its cmpxchg and skips its own deboost.
+		 */
+		if (atomic_cmpxchg(&pt->state, PVSCHED_BOOSTED,
+				   PVSCHED_NONE) == PVSCHED_BOOSTED)
+			hrtimer_try_to_cancel(&pt->timer);
+		ret = sched_setattr_pi_nocheck(p, &attr, false);
+	}
 out:
 	rcu_read_unlock();
 	put_task_struct(p);
@@ -412,8 +557,9 @@ out:
 
 /*
  * Unregister a vCPU: unhash its entry, then -- once in-flight dispatch readers
- * are done (grace period) -- drop the binding and free it. An entry exists only
- * while bound, so this is a full teardown; a later re-register starts fresh.
+ * are done (grace period) -- cancel its cap timer, return the still-live vCPU
+ * thread to baseline, drop the binding and free it. An entry exists only while
+ * bound, so this is a full teardown; a later re-register starts fresh.
  */
 static long pvsched_unregister_vcpu(void __user *uarg)
 {
@@ -436,7 +582,13 @@ static long pvsched_unregister_vcpu(void __user *uarg)
 	spin_unlock_irqrestore(&pvsched_ht_lock, flags);
 
 	if (pt) {
+		/*
+		 * Unhashed above: once readers drain, no boost can arm the timer,
+		 * so the cancel is final. Then deboost the still-live vCPU thread.
+		 */
 		synchronize_rcu();
+		hrtimer_cancel(&pt->timer);
+		pvsched_set_baseline(pt->task);
 		pvsched_task_free(pt);
 	}
 
@@ -655,6 +807,8 @@ static void __exit pvsched_exit(void)
 	 */
 	hash_for_each_safe(pvsched_ht, bkt, tmp, pt, hash) {
 		hash_del(&pt->hash);
+		hrtimer_cancel(&pt->timer);
+		pvsched_set_baseline(pt->task);
 		pvsched_task_free(pt);
 	}
 }
