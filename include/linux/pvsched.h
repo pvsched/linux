@@ -48,6 +48,13 @@ struct pvsched_policy_ops {
 int pvsched_register_policy(struct pvsched_policy_ops *ops);
 void pvsched_unregister_policy(struct pvsched_policy_ops *ops);
 
+/*
+ * Set a vCPU thread's scheduling parameters (@pid is resolved in the caller's
+ * pid namespace). Used by policy modules (BPF policy calls it as a kfunc).
+ * Returns 0 if applied or a negative error.
+ */
+int pvsched_set_params(s32 pid, u32 policy, s32 nice, u32 rt_prio);
+
 #else /* !CONFIG_PARAVIRT_SCHED_HOST */
 
 static inline int pvsched_register_policy(struct pvsched_policy_ops *ops)
@@ -56,6 +63,11 @@ static inline int pvsched_register_policy(struct pvsched_policy_ops *ops)
 }
 
 static inline void pvsched_unregister_policy(struct pvsched_policy_ops *ops) { }
+
+static inline int pvsched_set_params(s32 pid, u32 policy, s32 nice, u32 rt_prio)
+{
+	return -EOPNOTSUPP;
+}
 
 #endif /* CONFIG_PARAVIRT_SCHED_HOST */
 

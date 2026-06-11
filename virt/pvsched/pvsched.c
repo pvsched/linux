@@ -14,6 +14,8 @@
 #define pr_fmt(fmt) "pvsched: " fmt
 
 #include <linux/bpf.h>
+#include <linux/btf.h>
+#include <linux/btf_ids.h>
 #include <linux/build_bug.h>
 #include <linux/capability.h>
 #include <linux/debugfs.h>
@@ -31,7 +33,9 @@
 #include <linux/pvsched.h>
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
+#include <linux/sched/prio.h>
 #include <linux/sched/task.h>
+#include <uapi/linux/sched/types.h>		/* struct sched_attr */
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
@@ -151,6 +155,81 @@ static void pvsched_sched_exit_probe(void *data, struct task_struct *t,
 		schedule_work(&pvsched_teardown_work);
 	}
 }
+
+/**
+ * pvsched_set_params - set a vCPU thread's scheduling parameters
+ * @pid: pid of the vCPU thread, in the caller's pid namespace
+ * @policy: SCHED_* policy to apply (SCHED_DEADLINE is not supported)
+ * @nice: nice value, for fair policies
+ * @rt_prio: real-time priority, for SCHED_FIFO / SCHED_RR
+ *
+ * Called from a pvsched policy's callbacks: exported for policy modules, and
+ * registered as a kfunc for BPF policies. The change is applied with pi=false
+ * so it is safe from the interrupt context of the injection event; SCHED_DEADLINE
+ * is rejected because its setup can sleep. Only a registered vCPU thread may be
+ * targeted.
+ *
+ * Return: 0 if applied, or a negative error (-ESRCH, -EOPNOTSUPP, -EINVAL, or a
+ * scheduler error).
+ */
+__bpf_kfunc int pvsched_set_params(s32 pid, u32 policy, s32 nice, u32 rt_prio)
+{
+	struct sched_attr attr = {
+		.size		= sizeof(attr),
+		.sched_policy	= policy,
+		.sched_priority	= rt_prio,
+	};
+	struct task_struct *p;
+	struct pvsched_task *pt;
+	int ret;
+
+	switch (policy) {
+	case SCHED_NORMAL:
+	case SCHED_FIFO:
+	case SCHED_RR:
+	case SCHED_BATCH:
+	case SCHED_IDLE:
+		break;
+	case SCHED_DEADLINE:
+		return -EOPNOTSUPP;
+	default:
+		return -EINVAL;
+	}
+
+	/* __sched_setscheduler() does not clamp nice for fair policies. */
+	attr.sched_nice = clamp_t(s32, nice, MIN_NICE, MAX_NICE);
+
+	p = find_get_task_by_vpid(pid);
+	if (!p)
+		return -ESRCH;
+
+	/*
+	 * The rcu_read_lock() pins the entry across use (a free waits out a
+	 * grace period after unhashing). No entry: not a vCPU we track.
+	 */
+	rcu_read_lock();
+	pt = pvsched_task_find(p);
+	if (!pt) {
+		ret = -ESRCH;
+		goto out;
+	}
+
+	ret = sched_setattr_pi_nocheck(p, &attr, false);
+out:
+	rcu_read_unlock();
+	put_task_struct(p);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(pvsched_set_params);
+
+BTF_KFUNCS_START(pvsched_kfunc_ids)
+BTF_ID_FLAGS(func, pvsched_set_params)
+BTF_KFUNCS_END(pvsched_kfunc_ids)
+
+static const struct btf_kfunc_id_set pvsched_kfunc_set = {
+	.owner	= THIS_MODULE,
+	.set	= &pvsched_kfunc_ids,
+};
 
 static LIST_HEAD(pvsched_policies);
 static DEFINE_MUTEX(pvsched_mutex);
@@ -528,9 +607,13 @@ static int __init pvsched_init(void)
 	BUILD_BUG_ON(offsetof(union pvsched_vcpu_page, guest_area) != 64);
 	BUILD_BUG_ON(offsetof(union pvsched_vcpu_page, host_area) != 96);
 
-	ret = pvsched_register_probes();
+	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_TRACING, &pvsched_kfunc_set);
 	if (ret)
 		return ret;
+
+	ret = pvsched_register_probes();
+	if (ret)
+		goto err_probes;
 
 	ret = misc_register(&pvsched_dev);
 	if (ret)
@@ -546,6 +629,8 @@ static int __init pvsched_init(void)
 
 err_misc:
 	pvsched_unregister_probes();
+err_probes:
+	/* The kfunc set is dropped automatically when the module unloads. */
 	return ret;
 }
 
@@ -563,10 +648,10 @@ static void __exit pvsched_exit(void)
 	flush_work(&pvsched_teardown_work);
 
 	/*
-	 * Tear down any remaining (still-running) vCPUs. Nothing can race with
-	 * us: in-flight ioctls pin the module via fops->owner and the device is
-	 * deregistered, the probes are unregistered and synchronized, and the
-	 * teardown work is flushed -- the hash is ours alone, no lock needed.
+	 * Tear down any remaining vCPUs. Nothing can race with us: the device
+	 * is gone, the probes are quiesced, the teardown work is flushed, and
+	 * BPF users of the kfunc hold a module reference, so none are loaded
+	 * -- the hash is ours alone, no lock or RCU needed.
 	 */
 	hash_for_each_safe(pvsched_ht, bkt, tmp, pt, hash) {
 		hash_del(&pt->hash);
