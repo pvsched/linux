@@ -20,6 +20,7 @@
 #include <linux/hashtable.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/kvm_host.h>
 #include <linux/list.h>
 #include <linux/llist.h>
 #include <linux/miscdevice.h>
@@ -40,6 +41,7 @@
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
 
+#include <trace/events/kvm.h>
 #include <trace/events/sched.h>
 
 #include <uapi/linux/pvsched.h>
@@ -123,7 +125,7 @@ static void pvsched_teardown_fn(struct work_struct *w)
 	if (!batch)
 		return;
 
-	/* One grace period covers all in-flight readers. */
+	/* One grace period covers all in-flight dispatch readers. */
 	synchronize_rcu();
 
 	llist_for_each_entry_safe(pt, n, batch, teardown)
@@ -394,16 +396,107 @@ static struct miscdevice pvsched_dev = {
 	.fops	= &pvsched_dev_fops,
 };
 
-/* Tracepoint probes. */
+/*
+ * Event dispatch: the binding is read under RCU so a concurrent unbind cannot
+ * free the policy mid-call. vmentry/vmexit/halt all run in the vCPU thread
+ * itself; injection does not (see pvsched_inject_probe()).
+ */
+#define pvsched_dispatch_current(vcpu, cb)				\
+do {									\
+	struct pvsched_task *pt;					\
+	const struct pvsched_policy_ops *policy;			\
+									\
+	rcu_read_lock();						\
+	pt = pvsched_task_find(current);				\
+	if (pt) {							\
+		policy = READ_ONCE(pt->policy);				\
+		if (policy)						\
+			policy->cb(vcpu, READ_ONCE(pt->shm));		\
+	}								\
+	rcu_read_unlock();						\
+} while (0)
+
+static void pvsched_vmentry_probe(void *data, struct kvm_vcpu *vcpu)
+{
+	pvsched_dispatch_current(vcpu, vmentry);
+}
+
+static void pvsched_vmexit_probe(void *data, struct kvm_vcpu *vcpu)
+{
+	pvsched_dispatch_current(vcpu, vmexit);
+}
+
+static void pvsched_halt_probe(void *data, struct kvm_vcpu *vcpu)
+{
+	pvsched_dispatch_current(vcpu, halt);
+}
+
+/*
+ * Injection runs in the injector's context, not the vCPU thread; resolve the
+ * target via vcpu->pid. The pinned kernel mapping keeps @shm usable from this
+ * context too.
+ */
+static void pvsched_inject_probe(void *data, struct kvm_vcpu *vcpu)
+{
+	struct pvsched_task *pt;
+	const struct pvsched_policy_ops *policy;
+	struct task_struct *t;
+
+	rcu_read_lock();
+	t = pid_task(rcu_dereference(vcpu->pid), PIDTYPE_PID);
+	if (t) {
+		pt = pvsched_task_find(t);
+		if (pt) {
+			policy = READ_ONCE(pt->policy);
+			if (policy)
+				policy->inject(vcpu, READ_ONCE(pt->shm));
+		}
+	}
+	rcu_read_unlock();
+}
 
 static int pvsched_register_probes(void)
 {
-	return register_trace_sched_process_exit(pvsched_sched_exit_probe, NULL);
+	int ret;
+
+	ret = register_trace_kvm_pvsched_vmentry_tp(pvsched_vmentry_probe, NULL);
+	if (ret)
+		return ret;
+	ret = register_trace_kvm_pvsched_vmexit_tp(pvsched_vmexit_probe, NULL);
+	if (ret)
+		goto err_vmexit;
+	ret = register_trace_kvm_pvsched_vcpu_halt_tp(pvsched_halt_probe, NULL);
+	if (ret)
+		goto err_halt;
+	ret = register_trace_kvm_pvsched_vcpu_inject_intr_tp(pvsched_inject_probe,
+							     NULL);
+	if (ret)
+		goto err_inject;
+	ret = register_trace_sched_process_exit(pvsched_sched_exit_probe, NULL);
+	if (ret)
+		goto err_exit;
+	return 0;
+
+err_exit:
+	unregister_trace_kvm_pvsched_vcpu_inject_intr_tp(pvsched_inject_probe,
+							 NULL);
+err_inject:
+	unregister_trace_kvm_pvsched_vcpu_halt_tp(pvsched_halt_probe, NULL);
+err_halt:
+	unregister_trace_kvm_pvsched_vmexit_tp(pvsched_vmexit_probe, NULL);
+err_vmexit:
+	unregister_trace_kvm_pvsched_vmentry_tp(pvsched_vmentry_probe, NULL);
+	return ret;
 }
 
 static void pvsched_unregister_probes(void)
 {
 	unregister_trace_sched_process_exit(pvsched_sched_exit_probe, NULL);
+	unregister_trace_kvm_pvsched_vcpu_inject_intr_tp(pvsched_inject_probe,
+							 NULL);
+	unregister_trace_kvm_pvsched_vcpu_halt_tp(pvsched_halt_probe, NULL);
+	unregister_trace_kvm_pvsched_vmexit_tp(pvsched_vmexit_probe, NULL);
+	unregister_trace_kvm_pvsched_vmentry_tp(pvsched_vmentry_probe, NULL);
 	tracepoint_synchronize_unregister();
 }
 
@@ -465,7 +558,7 @@ static void __exit pvsched_exit(void)
 	debugfs_remove_recursive(pvsched_debugfs);
 	misc_deregister(&pvsched_dev);
 
-	/* No more exit notifications after this. */
+	/* No more events or exit notifications after this. */
 	pvsched_unregister_probes();
 	flush_work(&pvsched_teardown_work);
 
