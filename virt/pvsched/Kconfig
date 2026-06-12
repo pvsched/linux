@@ -16,3 +16,20 @@ config PARAVIRT_SCHED_HOST
 
 	  If unsure, say N.
 
+config PARAVIRT_SCHED_GUEST
+	bool "Paravirt scheduling guest support"
+	depends on X86_64 && TRACEPOINTS
+	help
+	  The guest core of paravirtualized scheduling: owns the shared
+	  per-vCPU pages, negotiates a policy with the host, and publishes the
+	  guest's scheduling intent (the parameters of the task each vCPU
+	  runs) for the host policy to act on. Built-in because the publishing
+	  hooks attach to unexported core tracepoints. A transport driver
+	  (e.g. PVSCHED_GUEST_PCI) is needed to reach the VMM.
+
+	  A kernel with this enabled runs unchanged on a host without pvsched:
+	  with no transport (or no host policy match) the hooks stay patched
+	  out.
+
+	  If unsure, say N.
+
