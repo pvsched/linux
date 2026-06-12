@@ -23,8 +23,10 @@
  * PVSCHED_HINT_KICK_DEBOOST in host_area and a published request drops in
  * priority, the probe induces an immediate exit through the
  * transport's kick op, so the host can deboost without waiting for a natural
- * vmexit (which a tick-less, CPU-bound vCPU might never take). (The
- * in-kernel critical-section bits are added separately.)
+ * vmexit (which a tick-less, CPU-bound vCPU might never take). Probes around
+ * the hardirq and softirq handlers set/clear the matching kern_cs bits (the
+ * NMI and PREEMPT_DISABLED bits are future work: NMIs have no bracketing
+ * tracepoint and the preempt on/off tracepoints depend on debug Kconfigs).
  *
  * The gating costs nothing when pvsched is not negotiated: the hooks are only
  * attached when the host enabled at least one vCPU (an unattached tracepoint
@@ -41,6 +43,7 @@
 #include <linux/errno.h>
 #include <linux/gfp.h>
 #include <linux/init.h>
+#include <linux/interrupt.h>	/* completes the irq trace event types */
 #include <linux/io.h>		/* virt_to_phys */
 #include <linux/kernel.h>
 #include <linux/moduleparam.h>
@@ -53,6 +56,7 @@
 #include <linux/string.h>
 #include <linux/tracepoint.h>
 
+#include <trace/events/irq.h>
 #include <trace/events/sched.h>
 
 #include <asm/smp.h>		/* x86_cpu_to_apicid */
@@ -123,6 +127,7 @@ static void pvsched_guest_switch_probe(void *data, bool preempt,
 
 	old.word = READ_ONCE(*(u32 *)&page->guest_area);
 
+	pub.ga.kern_cs		= old.ga.kern_cs;
 	pub.ga.sched_policy	= next->policy;
 	pub.ga.nice		= task_nice(next);
 	pub.ga.rt_prio		= next->rt_priority;
@@ -139,13 +144,90 @@ static void pvsched_guest_switch_probe(void *data, bool preempt,
 	}
 }
 
+/*
+ * In-kernel critical-section bits: set/cleared around the hardirq and softirq
+ * handlers, single-byte RMW on this CPU's own page. Best-effort by design: a
+ * hardirq nesting into the softirq probe's read-modify-write window can be
+ * momentarily misrepresented, but the bits self-heal on the handler's exit
+ * event -- acceptable for a scheduling hint, and it keeps the hot path free
+ * of irq disabling or atomics.
+ */
+static __always_inline void pvsched_guest_kerncs(u8 bit, bool set)
+{
+	union pvsched_vcpu_page *page = __this_cpu_read(pvsched_page);
+	u8 cs;
+
+	if (!page || READ_ONCE(page->header.status) != PVSCHED_STATUS_ENABLED)
+		return;
+
+	cs = READ_ONCE(page->guest_area.kern_cs);
+	WRITE_ONCE(page->guest_area.kern_cs, set ? (cs | bit) : (cs & ~bit));
+}
+
+static void pvsched_guest_irq_entry_probe(void *data, int irq,
+					  struct irqaction *action)
+{
+	pvsched_guest_kerncs(PVSCHED_KERNCS_HARDIRQ, true);
+}
+
+static void pvsched_guest_irq_exit_probe(void *data, int irq,
+					 struct irqaction *action, int ret)
+{
+	pvsched_guest_kerncs(PVSCHED_KERNCS_HARDIRQ, false);
+}
+
+static void pvsched_guest_softirq_entry_probe(void *data, unsigned int vec_nr)
+{
+	pvsched_guest_kerncs(PVSCHED_KERNCS_SOFTIRQ, true);
+}
+
+static void pvsched_guest_softirq_exit_probe(void *data, unsigned int vec_nr)
+{
+	pvsched_guest_kerncs(PVSCHED_KERNCS_SOFTIRQ, false);
+}
+
 static int pvsched_guest_attach_hooks(void)
 {
-	return register_trace_sched_switch(pvsched_guest_switch_probe, NULL);
+	int ret;
+
+	ret = register_trace_sched_switch(pvsched_guest_switch_probe, NULL);
+	if (ret)
+		return ret;
+	ret = register_trace_irq_handler_entry(pvsched_guest_irq_entry_probe,
+					       NULL);
+	if (ret)
+		goto err_irq_entry;
+	ret = register_trace_irq_handler_exit(pvsched_guest_irq_exit_probe,
+					      NULL);
+	if (ret)
+		goto err_irq_exit;
+	ret = register_trace_softirq_entry(pvsched_guest_softirq_entry_probe,
+					   NULL);
+	if (ret)
+		goto err_softirq_entry;
+	ret = register_trace_softirq_exit(pvsched_guest_softirq_exit_probe,
+					  NULL);
+	if (ret)
+		goto err_softirq_exit;
+	return 0;
+
+err_softirq_exit:
+	unregister_trace_softirq_entry(pvsched_guest_softirq_entry_probe, NULL);
+err_softirq_entry:
+	unregister_trace_irq_handler_exit(pvsched_guest_irq_exit_probe, NULL);
+err_irq_exit:
+	unregister_trace_irq_handler_entry(pvsched_guest_irq_entry_probe, NULL);
+err_irq_entry:
+	unregister_trace_sched_switch(pvsched_guest_switch_probe, NULL);
+	return ret;
 }
 
 static void pvsched_guest_detach_hooks(void)
 {
+	unregister_trace_softirq_exit(pvsched_guest_softirq_exit_probe, NULL);
+	unregister_trace_softirq_entry(pvsched_guest_softirq_entry_probe, NULL);
+	unregister_trace_irq_handler_exit(pvsched_guest_irq_exit_probe, NULL);
+	unregister_trace_irq_handler_entry(pvsched_guest_irq_entry_probe, NULL);
 	unregister_trace_sched_switch(pvsched_guest_switch_probe, NULL);
 	tracepoint_synchronize_unregister();
 }
