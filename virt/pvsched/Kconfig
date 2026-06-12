@@ -33,3 +33,12 @@ config PARAVIRT_SCHED_GUEST
 
 	  If unsure, say N.
 
+config PVSCHED_GUEST_PCI
+	tristate "Paravirt scheduling guest PCI transport"
+	depends on PARAVIRT_SCHED_GUEST && PCI
+	help
+	  The PCI binding of the pvsched discovery transport: a thin driver
+	  that binds the pvsched device exposed by the VMM and hands the guest
+	  core's shared pages to it through the device's table and doorbell.
+
+	  If unsure, say N.
