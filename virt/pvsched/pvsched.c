@@ -15,6 +15,7 @@
 
 #include <linux/atomic.h>
 #include <linux/bpf.h>
+#include <linux/bpf_verifier.h>
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
 #include <linux/build_bug.h>
@@ -457,6 +458,150 @@ pvsched_match_policy(const struct pvsched_header *hdr, u32 *status)
 	return found;
 }
 
+/*
+ * BPF struct_ops front-end: a BPF program implements pvsched_policy_ops and
+ * registers it like a module policy would (precedent: tcp_congestion_ops).
+ */
+
+#if IS_ENABLED(CONFIG_BPF_SYSCALL)
+
+/* Resolved at build time by resolve_btfids, against this module's BTF. */
+BTF_ID_LIST_SINGLE(pvsched_vcpu_page_ids, union, pvsched_vcpu_page)
+
+/* This module's BTF, saved at struct_ops registration. */
+static const struct btf *pvsched_btf;
+
+static int pvsched_bpf_init(struct btf *btf)
+{
+	pvsched_btf = btf;
+	return 0;
+}
+
+/*
+ * Writes through a shared-page pointer: only the host side of the page --
+ * host_area -- is writable. The header is the framework's to write and
+ * guest_area is the guest's; and no other BTF pointer (the vCPU and anything
+ * reached through it) is writable at all. Reads are unrestricted.
+ */
+static int pvsched_bpf_btf_struct_access(struct bpf_verifier_log *log,
+					 const struct bpf_reg_state *reg,
+					 int off, int size)
+{
+	if (reg->btf != pvsched_btf || reg->btf_id != pvsched_vcpu_page_ids[0]) {
+		bpf_log(log, "only writes to pvsched_vcpu_page are supported\n");
+		return -EACCES;
+	}
+
+	if (off < offsetof(union pvsched_vcpu_page, host_area) ||
+	    off + size > offsetofend(union pvsched_vcpu_page, host_area)) {
+		bpf_log(log, "only host_area of pvsched_vcpu_page is writable\n");
+		return -EACCES;
+	}
+
+	return 0;
+}
+
+static const struct bpf_verifier_ops pvsched_bpf_verifier_ops = {
+	.get_func_proto		= bpf_base_func_proto,
+	.is_valid_access	= bpf_tracing_btf_ctx_access,
+	.btf_struct_access	= pvsched_bpf_btf_struct_access,
+};
+
+static int pvsched_bpf_init_member(const struct btf_type *t,
+				   const struct btf_member *member,
+				   void *kdata, const void *udata)
+{
+	const struct pvsched_policy_ops *uops = udata;
+	struct pvsched_policy_ops *ops = kdata;
+	u32 moff;
+
+	moff = __btf_member_bit_offset(t, member) / 8;
+	switch (moff) {
+	case offsetof(struct pvsched_policy_ops, name):
+		if (bpf_obj_name_cpy(ops->name, uops->name,
+				     sizeof(ops->name)) <= 0)
+			return -EINVAL;
+		return 1;
+	case offsetof(struct pvsched_policy_ops, abi_version):
+		ops->abi_version = uops->abi_version;
+		return 1;
+	case offsetof(struct pvsched_policy_ops, version):
+		ops->version = uops->version;
+		return 1;
+	}
+	return 0;
+}
+
+static int pvsched_bpf_reg(void *kdata, struct bpf_link *link)
+{
+	return pvsched_register_policy(kdata);
+}
+
+static void pvsched_bpf_unreg(void *kdata, struct bpf_link *link)
+{
+	pvsched_unregister_policy(kdata);
+}
+
+static void pvsched_bpf_vmentry(struct kvm_vcpu *vcpu,
+				union pvsched_vcpu_page *shm)
+{
+}
+
+static void pvsched_bpf_vmexit(struct kvm_vcpu *vcpu,
+			       union pvsched_vcpu_page *shm)
+{
+}
+
+static void pvsched_bpf_halt(struct kvm_vcpu *vcpu,
+			     union pvsched_vcpu_page *shm)
+{
+}
+
+static void pvsched_bpf_inject(struct kvm_vcpu *vcpu,
+			       union pvsched_vcpu_page *shm)
+{
+}
+
+static struct pvsched_policy_ops __bpf_pvsched_policy_ops = {
+	.vmentry	= pvsched_bpf_vmentry,
+	.vmexit		= pvsched_bpf_vmexit,
+	.halt		= pvsched_bpf_halt,
+	.inject		= pvsched_bpf_inject,
+};
+
+static struct bpf_struct_ops bpf_pvsched_policy_ops = {
+	.verifier_ops	= &pvsched_bpf_verifier_ops,
+	.init		= pvsched_bpf_init,
+	.init_member	= pvsched_bpf_init_member,
+	.reg		= pvsched_bpf_reg,
+	.unreg		= pvsched_bpf_unreg,
+	.name		= "pvsched_policy_ops",
+	.cfi_stubs	= &__bpf_pvsched_policy_ops,
+	.owner		= THIS_MODULE,
+};
+
+static int pvsched_bpf_struct_ops_init(void)
+{
+	int ret;
+
+	/* So a struct_ops policy can call pvsched_set_params(). */
+	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS,
+					&pvsched_kfunc_set);
+	if (ret)
+		return ret;
+	return register_bpf_struct_ops(&bpf_pvsched_policy_ops,
+				       pvsched_policy_ops);
+}
+
+#else /* !CONFIG_BPF_SYSCALL */
+
+static int pvsched_bpf_struct_ops_init(void)
+{
+	return 0;
+}
+
+#endif /* CONFIG_BPF_SYSCALL */
+
 /* Per-vCPU registration (/dev/pvsched). */
 
 static long pvsched_register_vcpu(void __user *uarg)
@@ -763,6 +908,10 @@ static int __init pvsched_init(void)
 	BUILD_BUG_ON(offsetof(union pvsched_vcpu_page, host_area) != 96);
 
 	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_TRACING, &pvsched_kfunc_set);
+	if (ret)
+		return ret;
+
+	ret = pvsched_bpf_struct_ops_init();
 	if (ret)
 		return ret;
 
