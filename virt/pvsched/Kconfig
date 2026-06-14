@@ -16,6 +16,19 @@ config PARAVIRT_SCHED_HOST
 
 	  If unsure, say N.
 
+config PVSCHED_DEMO
+	tristate "Paravirt scheduling demo policy (testing)"
+	depends on PARAVIRT_SCHED_HOST
+	help
+	  A minimal sample pvsched policy module used to exercise the host
+	  framework end to end. It registers a policy named "demo" that applies
+	  the guest's requested scheduling parameters to the vCPU thread on
+	  vmexit, publishes the vCPU status in the shared page, boosts the vCPU
+	  on interrupt injection, and exposes event counters in debugfs
+	  (pvsched_demo/stats).
+
+	  If unsure, say N.
+
 config PARAVIRT_SCHED_GUEST
 	bool "Paravirt scheduling guest support"
 	depends on X86_64 && TRACEPOINTS
