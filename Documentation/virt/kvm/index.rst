@@ -19,4 +19,5 @@ KVM
    locking
    vcpu-requests
    halt-polling
+   pvsched-v3
    review-checklist
