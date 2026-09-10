@@ -85,6 +85,7 @@ TARGETS += pcie_bwctrl
 TARGETS += perf_events
 TARGETS += pidfd
 TARGETS += pid_namespace
+TARGETS += pvsched
 TARGETS += power_supply
 TARGETS += powerpc
 TARGETS += prctl
