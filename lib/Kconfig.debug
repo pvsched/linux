@@ -2328,6 +2328,17 @@ config CPUMASK_KUNIT_TEST
 
 	  If unsure, say N.
 
+config PVSCHED_ACCOUNTING_KUNIT_TEST
+	tristate "KUnit test for pvsched budget accounting" if !KUNIT_ALL_TESTS
+	depends on KUNIT && PVSCHED
+	default KUNIT_ALL_TESTS
+	help
+	  Enable tests for the deterministic pvsched budget accounting core.
+	  Exercise charging, recovery, throttle latches and overflow handling.
+	  These tests do not enable runtime scheduling or require KVM.
+
+	  If unsure, say N.
+
 config TEST_LIST_SORT
 	tristate "Linked list sorting test" if !KUNIT_ALL_TESTS
 	depends on KUNIT
