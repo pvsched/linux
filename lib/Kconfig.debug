@@ -2339,6 +2339,18 @@ config PVSCHED_ACCOUNTING_KUNIT_TEST
 
 	  If unsure, say N.
 
+config PVSCHED_DEFAULT_POLICY_KUNIT_TEST
+	tristate "KUnit test for pvsched built-in policy selection" if !KUNIT_ALL_TESTS
+	depends on KUNIT && PVSCHED
+	default KUNIT_ALL_TESTS
+	help
+	  Enable tests for built-in guest request validation and selection.
+	  Exercise class mapping, priority caps, critical-section arbitration,
+	  throttling, pending comparison and invalid-input preservation.
+	  These tests do not enable runtime scheduling or require KVM.
+
+	  If unsure, say N.
+
 config TEST_LIST_SORT
 	tristate "Linked list sorting test" if !KUNIT_ALL_TESTS
 	depends on KUNIT
