@@ -5,3 +5,5 @@ pvsched-y := core.o accounting.o policy.o default_policy.o
 
 obj-$(CONFIG_PVSCHED_ACCOUNTING_KUNIT_TEST) += pvsched-accounting-test.o
 pvsched-accounting-test-y := accounting_test.o
+obj-$(CONFIG_PVSCHED_DEFAULT_POLICY_KUNIT_TEST) += pvsched-default-policy-test.o
+pvsched-default-policy-test-y := default_policy_test.o
