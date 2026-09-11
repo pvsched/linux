@@ -5,7 +5,7 @@ Paravirtualized scheduling (pvsched)
 ====================================
 
 :Author: Vineeth Pillai
-:Status: ABI definition and internal accounting core; runtime support is not yet implemented
+:Status: ABI and internal policy/accounting cores; runtime support is not yet implemented
 
 Overview
 ========
@@ -22,10 +22,10 @@ to select temporary scheduling parameters for the corresponding virtual CPU
 thread.  The framework, policy implementations, KVM event sources, transport,
 and lifecycle interfaces are deliberately separate from the shared-page ABI.
 
-Only the ABI version 1 shared-page representation and deterministic budget
-arithmetic are defined at this stage.  There is no registration ioctl, KVM
-hook, transport binding, scheduler interface, or runtime pvsched implementation
-yet.
+Only the ABI version 1 shared-page representation, deterministic budget
+arithmetic, and built-in request selection are defined at this stage.  There is
+no registration ioctl, KVM hook, transport binding, scheduler interface, or
+runtime pvsched implementation yet.
 
 Architecture
 ============
@@ -67,6 +67,33 @@ scheduler, or enforcement mechanism.  Future serialized account code must
 measure and order intervals, preserve account lifetime, and act on the latches.
 The core is exercised through a separate KUnit test configuration; it is not
 linked into an active pvsched runtime at this stage.
+
+Built-in request selection
+==========================
+
+The selector expects a snapshot of the complete default guest area that its
+caller validated; it validates configuration and baseline even when
+throttled.  It maps NORMAL and BATCH to host NORMAL with the guest nice
+value, IDLE to host IDLE, FIFO and RR to capped host FIFO, and guest DEADLINE
+to host FIFO at a separately configured priority.  It never requests host
+DEADLINE.  Current and valid pending task descriptions are compared after
+mapping, with the current description retained on a tie.
+
+Generic throttling suppresses CS elevation and clamps each above-baseline task
+candidate to the saved NORMAL baseline.  The usual task rule is then applied:
+pending replaces the clamped current request only when pending is strictly more
+urgent.  Thus a current below-baseline NORMAL nice or IDLE request survives,
+but a stale, less-urgent pending hint cannot deboost below current's clamped
+intent.  Without generic throttling, an active, eligible critical section
+selects the configured CS FIFO request; a throttled CS request reveals the
+independently selected task request.  There is no unconditional baseline
+priority floor.  Invalid input produces no selection.
+
+The selector neither accesses shared memory nor applies scheduling, updates
+accounting, or retains a previous decision.  Its explicit priority controls
+have no runtime configuration interface yet.  Later integration must define
+how invalid runtime snapshots are handled and must account actual successfully
+applied execution rather than a selected request.
 
 Shared-page ABI
 ===============
