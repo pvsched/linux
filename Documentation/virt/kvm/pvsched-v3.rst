@@ -5,7 +5,7 @@ Paravirtualized scheduling (pvsched)
 ====================================
 
 :Author: Vineeth Pillai
-:Status: ABI definition; runtime support is not yet implemented
+:Status: ABI definition and internal accounting core; runtime support is not yet implemented
 
 Overview
 ========
@@ -22,9 +22,10 @@ to select temporary scheduling parameters for the corresponding virtual CPU
 thread.  The framework, policy implementations, KVM event sources, transport,
 and lifecycle interfaces are deliberately separate from the shared-page ABI.
 
-Only the ABI version 1 shared-page representation is defined at this stage.
-There is no registration ioctl, KVM hook, transport binding, scheduler
-interface, or runtime pvsched implementation yet.
+Only the ABI version 1 shared-page representation and deterministic budget
+arithmetic are defined at this stage.  There is no registration ioctl, KVM
+hook, transport binding, scheduler interface, or runtime pvsched implementation
+yet.
 
 Architecture
 ============
@@ -45,6 +46,27 @@ The planned design has four components:
 KVM will provide events, but will not own policy selection, shared-page
 negotiation, or boost accounting.  Runtime interfaces and event ordering remain
 future implementation work and are not implied by the ABI definitions.
+
+Budget accounting core
+======================
+
+The host includes a deterministic internal core for the two framework-managed
+boost debts.  Internal constants provide a 2 ms default critical-section limit
+and a 500 ms default generic-boost limit.  No runtime controls for these
+defaults exist at this stage.  The generic budget covers every charged boost
+interval: guest task execution, guest critical-section execution, and an
+explicit custom VMM boost.  Critical-section execution additionally drains the
+CS budget.  Uncharged time recovers each debt independently at a 1:1 rate.
+Additions saturate instead of wrapping, recovery floors at zero, and a throttle
+latch clears only when its debt reaches zero.
+
+The core consumes explicit durations classified by actual applied execution.
+An interval containing a classification transition must be split in time order.
+It stores no clock or timestamp and provides no locking, timer, eligibility,
+scheduler, or enforcement mechanism.  Future serialized account code must
+measure and order intervals, preserve account lifetime, and act on the latches.
+The core is exercised through a separate KUnit test configuration; it is not
+linked into an active pvsched runtime at this stage.
 
 Shared-page ABI
 ===============
