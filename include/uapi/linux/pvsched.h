@@ -2,12 +2,96 @@
 #ifndef _UAPI_LINUX_PVSCHED_H
 #define _UAPI_LINUX_PVSCHED_H
 
+#include <linux/ioctl.h>
 #include <linux/types.h>
+
+#define PVSCHED_CONTROL_VERSION		1
+#define PVSCHED_IOCTL_TYPE		0xb9
+/* Policy names, in control structs and in the shared page. */
+#define PVSCHED_NAME_MAX		32
+
+/* Control structs are native-endian, fixed-size, and contain no pointers. */
+struct pvsched_info {
+	__u32 control_version;
+	__u32 flags;
+	__u32 max_runners_per_session;
+	__u32 max_runners_global;
+	__u32 max_sessions_global;
+	__u32 max_shm_pages_per_session;
+	__u32 max_shm_pages_global;
+	__u32 reserved;
+};
+
+struct pvsched_create_runner {
+	/* Input: flags, runner_id, and reserved must be zero; tid is positive. */
+	__u32 flags;
+	__s32 tid;
+	__aligned_u64 runner_id;
+	__aligned_u64 reserved[2];
+};
+
+enum pvsched_runner_state {
+	/* A pid association exists; this does not guarantee a live task. */
+	PVSCHED_RUNNER_INACTIVE = 0,
+	/* No task was associated with the pid when QUERY sampled it. */
+	PVSCHED_RUNNER_EXITED = 1,
+	/* An enabled shared-memory attachment admits runtime service. */
+	PVSCHED_RUNNER_ACTIVE = 2,
+};
+
+#define PVSCHED_QUERY_RUNNER_LAST_FAULT_VALID	(1U << 0)
+
+struct pvsched_query_runner {
+	/* Input: runner_id is nonzero; every other field is zero. */
+	__aligned_u64 runner_id;
+	__u32 flags;
+	__u32 state;
+	__s32 last_fault_errno;
+	__u32 reserved0;
+	__aligned_u64 reserved1;
+};
+
+/*
+ * Enumerate the registered host policies: set index from 0 upwards until
+ * ENOENT.  Every other input field is zero.
+ */
+struct pvsched_policy_info {
+	__u32 index;
+	__u32 flags;
+	char name[PVSCHED_NAME_MAX];
+	__u32 version;
+	__u32 protocol;
+	/* Size of the policy's private parameters; informational. */
+	__u32 params_size;
+	__u32 reserved;
+};
+
+/*
+ * Select the session's host policy, once, before its first CREATE_RUNNER.
+ * name is nonempty, NUL-terminated and zero-padded; flags is zero.
+ */
+struct pvsched_set_policy {
+	char name[PVSCHED_NAME_MAX];
+	__u32 version;
+	__u32 flags;
+};
+
+/* On any ioctl error, including a late EEXIST, output is unspecified. */
+
+#define PVSCHED_GET_INFO \
+	_IOR(PVSCHED_IOCTL_TYPE, 0, struct pvsched_info)
+#define PVSCHED_CREATE_RUNNER \
+	_IOWR(PVSCHED_IOCTL_TYPE, 1, struct pvsched_create_runner)
+#define PVSCHED_QUERY_RUNNER \
+	_IOWR(PVSCHED_IOCTL_TYPE, 2, struct pvsched_query_runner)
+#define PVSCHED_QUERY_POLICY \
+	_IOWR(PVSCHED_IOCTL_TYPE, 5, struct pvsched_policy_info)
+#define PVSCHED_SET_POLICY \
+	_IOW(PVSCHED_IOCTL_TYPE, 6, struct pvsched_set_policy)
 
 /* Shared-page ABI version and fixed wire sizes. */
 #define PVSCHED_ABI_VERSION		1
 #define PVSCHED_VCPU_STRIDE		4096
-#define PVSCHED_NAME_MAX		32
 #define PVSCHED_COMMON_HEADER_SIZE	64
 #define PVSCHED_GUEST_AREA_SIZE		64
 #define PVSCHED_HOST_AREA_SIZE		64
