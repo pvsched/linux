@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <linux/errno.h>
+#include <linux/export.h>
+#include <kunit/visibility.h>
 #include <linux/limits.h>
 
 #include "accounting.h"
@@ -51,6 +53,7 @@ int pvsched_accounting_init(struct pvsched_accounting *accounting,
 
 	return 0;
 }
+EXPORT_SYMBOL_IF_KUNIT(pvsched_accounting_init);
 
 int pvsched_accounting_update(struct pvsched_accounting *accounting,
 			      u64 elapsed_ns,
@@ -75,3 +78,4 @@ int pvsched_accounting_update(struct pvsched_accounting *accounting,
 
 	return 0;
 }
+EXPORT_SYMBOL_IF_KUNIT(pvsched_accounting_update);
