@@ -2,7 +2,61 @@
 #ifndef _UAPI_LINUX_PVSCHED_H
 #define _UAPI_LINUX_PVSCHED_H
 
+#include <linux/ioctl.h>
 #include <linux/types.h>
+
+#define PVSCHED_CONTROL_VERSION		1
+#define PVSCHED_IOCTL_TYPE		0xb9
+
+/* Control structs are native-endian, fixed-size, and contain no pointers. */
+struct pvsched_info {
+	__u32 control_version;
+	__u32 flags;
+	__u32 max_runners_per_session;
+	__u32 max_runners_global;
+	__u32 max_sessions_global;
+	__u32 max_shm_pages_per_session;
+	__u32 max_shm_pages_global;
+	__u32 reserved;
+};
+
+struct pvsched_create_runner {
+	/* Input: flags, runner_id, and reserved must be zero; tid is positive. */
+	__u32 flags;
+	__s32 tid;
+	__aligned_u64 runner_id;
+	__aligned_u64 reserved[2];
+};
+
+enum pvsched_runner_state {
+	/* A pid association exists; this does not guarantee a live task. */
+	PVSCHED_RUNNER_INACTIVE = 0,
+	/* No task was associated with the pid when QUERY sampled it. */
+	PVSCHED_RUNNER_EXITED = 1,
+	/* An enabled shared-memory attachment admits runtime service. */
+	PVSCHED_RUNNER_ACTIVE = 2,
+};
+
+#define PVSCHED_QUERY_RUNNER_LAST_FAULT_VALID	(1U << 0)
+
+struct pvsched_query_runner {
+	/* Input: runner_id is nonzero; every other field is zero. */
+	__aligned_u64 runner_id;
+	__u32 flags;
+	__u32 state;
+	__s32 last_fault_errno;
+	__u32 reserved0;
+	__aligned_u64 reserved1;
+};
+
+/* On any ioctl error, including a late EEXIST, output is unspecified. */
+
+#define PVSCHED_GET_INFO \
+	_IOR(PVSCHED_IOCTL_TYPE, 0, struct pvsched_info)
+#define PVSCHED_CREATE_RUNNER \
+	_IOWR(PVSCHED_IOCTL_TYPE, 1, struct pvsched_create_runner)
+#define PVSCHED_QUERY_RUNNER \
+	_IOWR(PVSCHED_IOCTL_TYPE, 2, struct pvsched_query_runner)
 
 /* Shared-page ABI version and fixed wire sizes. */
 #define PVSCHED_ABI_VERSION		1
