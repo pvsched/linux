@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <linux/errno.h>
+#include <linux/export.h>
 #include <linux/sched.h>
 #include <linux/sched/prio.h>
+#include <kunit/visibility.h>
 #include <asm/byteorder.h>
 
 #include "default_policy.h"
@@ -210,3 +212,4 @@ out:
 	*result = selected;
 	return 0;
 }
+EXPORT_SYMBOL_IF_KUNIT(pvsched_default_policy_select);

@@ -5,7 +5,7 @@ Paravirtualized scheduling (pvsched)
 ====================================
 
 :Author: Vineeth Pillai
-:Status: ABI and internal policy/accounting cores; runtime support is not yet implemented
+:Status: ABI, inactive runner control, and internal policy/accounting cores
 
 Overview
 ========
@@ -22,10 +22,10 @@ to select temporary scheduling parameters for the corresponding virtual CPU
 thread.  The framework, policy implementations, KVM event sources, transport,
 and lifecycle interfaces are deliberately separate from the shared-page ABI.
 
-Only the ABI version 1 shared-page representation, deterministic budget
-arithmetic, and built-in request selection are defined at this stage.  There is
-no registration ioctl, KVM hook, transport binding, scheduler interface, or
-runtime pvsched implementation yet.
+The ABI version 1 shared-page representation, deterministic budget arithmetic,
+built-in request selection, and an inactive runner-identity control plane are
+defined at this stage.  There is no page attachment, KVM hook, transport
+binding, scheduler interface, or runtime pvsched implementation yet.
 
 Architecture
 ============
@@ -95,6 +95,43 @@ accounting, or retains a previous decision.  Its explicit priority controls
 have no runtime configuration interface yet.  Later integration must define
 how invalid runtime snapshots are handled and must account actual successfully
 applied execution rather than a selected request.
+
+Inactive runner control
+=======================
+
+Opening ``/dev/pvsched`` with read/write access creates a session.  The opener
+and every ioctl require ``CAP_SYS_NICE`` in the initial
+user namespace.  ``GET_INFO`` reports the control version and resource limits;
+userspace reads the limits from it, as the UAPI header does not define them.
+``CREATE_RUNNER`` resolves a caller-owned thread ID once and retains its
+``struct pid`` identity under a session-local, non-reused runner ID.
+``QUERY_RUNNER`` reports whether that identity currently has an associated
+task.  A retained pid prevents numeric PID reuse from retargeting a runner but
+does not keep a task alive.
+
+The session retains both the opening TGID and mm identity.  A TGID can survive
+exec, while an mm identifies the original address space; conversely,
+``CLONE_VM`` can share an mm across distinct thread groups.  Therefore every
+ioctl must match both.  The mm reference prevents reuse of the
+``mm_struct`` without retaining its userspace mappings.  ``O_CLOEXEC`` is
+recommended VMM hygiene, not an ownership mechanism.
+
+Authorization is checked before command dispatch.  An unauthorized caller
+therefore receives ``EPERM`` even for an unknown command; an authorized caller
+receives ``ENOTTY`` for an unknown command.
+
+Runner identities remain inactive: creation captures no scheduling baseline,
+attaches no shared page, and cannot boost or otherwise change the target.
+Exit is sampled rather than latched, and stale registrations consume quota
+until final session close.  A thread-ID association can change during exec;
+future runtime activation must revalidate its owner and task context rather
+than treating a retained pid as an immutable task identity.  Final close
+removes every runner owned by the session.
+
+Session and runner counts are bounded globally and per session.  Global counts
+include reservations for opens and creates still in flight, so concurrent
+operations cannot transiently exceed the advertised limits.  Failed operations
+return their reservations; published runners retain quota until final close.
 
 Shared-page ABI
 ===============

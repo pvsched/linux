@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config PVSCHED
+	tristate "Paravirtualized scheduling host framework"
+	help
+	  Provide the pvsched host control device.  The current implementation
+	  creates device-owned sessions and records inactive vCPU runner
+	  identities.  It does not attach shared pages, integrate with KVM, or
+	  change task scheduling.
