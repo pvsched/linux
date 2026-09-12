@@ -111,6 +111,54 @@ bool pvsched_default_guest_valid(const struct pvsched_default_guest_area *guest)
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_default_guest_valid);
 
+int pvsched_policy_query(u32 index, struct pvsched_policy_info *info)
+{
+	struct pvsched_policy_entry *entry;
+
+	guard(mutex)(&pvsched_policy_mutex);
+	list_for_each_entry(entry, &pvsched_policies, node) {
+		if (index--)
+			continue;
+		memcpy(info->name, entry->ops->name, sizeof(info->name));
+		info->version = entry->ops->version;
+		info->protocol = entry->ops->protocol;
+		info->params_size = entry->ops->params_size;
+		return 0;
+	}
+	return -ENOENT;
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_policy_query);
+
+int pvsched_policy_pin(const char *name, u32 version,
+		       struct pvsched_policy_entry **pinned)
+{
+	struct pvsched_policy_entry *entry;
+
+	guard(mutex)(&pvsched_policy_mutex);
+	entry = pvsched_policy_find_locked(name, version);
+	if (!entry)
+		return -ENOENT;
+	/*
+	 * A module still in its init can fail it and be freed whatever its
+	 * reference count, so its policy is not selectable until init is done.
+	 * A module on its way out is as good as unregistered.
+	 */
+	if ((entry->owner && module_is_coming(entry->owner)) ||
+	    !try_module_get(entry->owner))
+		return -ENOENT;
+	pvsched_policy_entry_get(entry);
+	*pinned = entry;
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_policy_pin);
+
+void pvsched_policy_unpin(struct pvsched_policy_entry *entry)
+{
+	module_put(entry->owner);
+	pvsched_policy_entry_put(entry);
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_policy_unpin);
+
 static bool pvsched_policy_ops_valid(const struct pvsched_policy_ops *ops)
 {
 	return pvsched_policy_name_valid(ops->name) &&

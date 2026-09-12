@@ -33,6 +33,18 @@ struct pvsched_policy_entry *pvsched_policy_lookup(const char *name,
 void pvsched_policy_entry_get(struct pvsched_policy_entry *entry);
 void pvsched_policy_entry_put(struct pvsched_policy_entry *entry);
 
+/* Fill in the policy at @index in registration order, or -ENOENT. */
+int pvsched_policy_query(u32 index, struct pvsched_policy_info *info);
+
+/*
+ * Pin a live policy for a session: a reference on its entry and on its
+ * module, so that neither goes away while the session may still call it,
+ * even after it is unregistered.  -ENOENT if it is not registered.
+ */
+int pvsched_policy_pin(const char *name, u32 version,
+		       struct pvsched_policy_entry **pinned);
+void pvsched_policy_unpin(struct pvsched_policy_entry *entry);
+
 /*
  * Whether a private snapshot of the default guest area is well formed:
  * valid task tuples, a zero pending tuple unless flagged, and no reserved

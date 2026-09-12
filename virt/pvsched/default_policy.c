@@ -163,6 +163,7 @@ out:
 	*result = selected;
 	return 0;
 }
+EXPORT_SYMBOL_IF_KUNIT(pvsched_default_policy_select);
 
 struct pvsched_policy_ops pvsched_default_policy_ops = {
 	.name = PVSCHED_DEFAULT_POLICY_NAME,

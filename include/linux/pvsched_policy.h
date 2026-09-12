@@ -38,7 +38,9 @@ struct pvsched_policy_ops {
 
 /*
  * Register last in module init and unregister first in module exit.
- * Unregistering only unlists the policy.
+ * Unregistering only unlists the policy: a session that selected it keeps
+ * it, and a reference on its module, until the session closes, so the
+ * module cannot be removed meanwhile.
  */
 int __pvsched_register_policy(struct pvsched_policy_ops *ops,
 			      struct module *owner);
