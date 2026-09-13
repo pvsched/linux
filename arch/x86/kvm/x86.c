@@ -82,10 +82,12 @@
 #include <asm/tlbflush.h>
 #include <asm/intel_pt.h>
 #include <asm/emulate_prefix.h>
+#include <asm/kvm_pvsched.h>
 #include <asm/sgx.h>
 #include <clocksource/hyperv_timer.h>
 
 #define CREATE_TRACE_POINTS
+#include <trace/events/kvm_pvsched.h>
 #include "trace.h"
 
 #define MAX_IO_MSRS 256
@@ -991,6 +993,21 @@ void kvm_inject_emulated_page_fault(struct kvm_vcpu *vcpu,
 	fault_mmu->inject_page_fault(vcpu, fault);
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_inject_emulated_page_fault);
+
+#if IS_ENABLED(CONFIG_PVSCHED)
+void kvm_pvsched_run_enter(struct kvm_vcpu *vcpu)
+{
+	if (trace_kvm_pvsched_run_enter_tp_enabled())
+		trace_kvm_pvsched_run_enter_tp(vcpu);
+}
+
+void kvm_pvsched_run_leave(struct kvm_vcpu *vcpu, int ret)
+{
+	if (trace_kvm_pvsched_run_leave_tp_enabled())
+		trace_kvm_pvsched_run_leave_tp(vcpu, ret,
+					       READ_ONCE(vcpu->run->exit_reason));
+}
+#endif
 
 void kvm_inject_nmi(struct kvm_vcpu *vcpu)
 {
@@ -11497,6 +11514,13 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 	if (r)
 		return r;
 
+	/*
+	 * Probes run synchronously and must not sleep.  The vCPU and current
+	 * pointers are borrowed for the callback.  current is the executing
+	 * thread and vcpu->pid has already been updated by generic KVM code.
+	 */
+	kvm_pvsched_run_enter(vcpu);
+
 	vcpu_load(vcpu);
 	kvm_sigset_activate(vcpu);
 	kvm_run->flags = 0;
@@ -11603,6 +11627,8 @@ out:
 
 	kvm_sigset_deactivate(vcpu);
 	vcpu_put(vcpu);
+	/* Untrusted userspace-writable snapshot; ignore it on error. */
+	kvm_pvsched_run_leave(vcpu, r);
 	return r;
 }
 
@@ -13650,6 +13676,10 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_exit);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_msr_protocol_enter);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_msr_protocol_exit);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_rmp_fault);
+#if IS_ENABLED(CONFIG_PVSCHED)
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_pvsched_run_enter_tp);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_pvsched_run_leave_tp);
+#endif
 
 static int __init kvm_x86_init(void)
 {

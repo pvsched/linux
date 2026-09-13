@@ -5,7 +5,7 @@ Paravirtualized scheduling (pvsched)
 ====================================
 
 :Author: Vineeth Pillai
-:Status: ABI, inactive runner control, and internal policy/accounting cores
+:Status: ABI, inactive control, request/accounting cores, and KVM_RUN hooks
 
 Overview
 ========
@@ -24,8 +24,8 @@ and lifecycle interfaces are deliberately separate from the shared-page ABI.
 
 The ABI version 1 shared-page representation, deterministic budget arithmetic,
 built-in request selection, and an inactive runner-identity control plane are
-defined at this stage.  There is no page attachment, KVM hook, transport
-binding, scheduler interface, or runtime pvsched implementation yet.
+defined at this stage.  There is no page attachment, transport binding,
+scheduler interface, or runtime pvsched implementation yet.
 
 Architecture
 ============
@@ -43,9 +43,10 @@ The planned design has four components:
   policies return requests for framework service, while explicitly selected
   policy-managed bindings own their scheduling and throttling behavior.
 
-KVM will provide events, but will not own policy selection, shared-page
-negotiation, or boost accounting.  Runtime interfaces and event ordering remain
-future implementation work and are not implied by the ABI definitions.
+x86 KVM provides factual architecture-run boundary events, but does not own policy
+selection, shared-page negotiation, or boost accounting.  Runtime interfaces
+and inner guest-entry/exit ordering remain future implementation work and are
+not implied by the ABI definitions.
 
 Budget accounting core
 ======================
@@ -135,6 +136,41 @@ Session and runner counts are bounded globally and per session.  Global counts
 include reservations for opens and creates still in flight, so concurrent
 operations cannot transiently exceed the advertised limits.  Failed operations
 return their reservations; published runners retain quota until final close.
+
+x86 KVM run boundaries
+======================
+
+x86 KVM declares bare ``kvm_pvsched_run_enter`` and
+``kvm_pvsched_run_leave`` hooks, whose generated tracepoint symbols carry the
+``_tp`` suffix, around ``kvm_arch_vcpu_ioctl_run()``.  Generic KVM has already
+validated the ioctl argument and updated the runner pid, and x86 KVM has
+completed MMU post-initialization, before entry.  Leave occurs on every
+architecture-run path after entry and reports the signed result plus a raw
+exit-reason snapshot.  The exit reason is useful when the result is zero, but
+remains userspace-writable and untrusted and does not prove guest entry.
+Consumers must ignore it when the result is negative.
+
+Generic failures, including invalid arguments, and MMU post-initialization
+failures publish neither event.  A complete pair does not prove that guest
+entry occurred: immediate exit, signal interruption, and later architecture
+failures can all produce a pair.  Callbacks run synchronously with the vCPU
+mutex held, must not sleep, and may use the vCPU and current task pointers only
+for the duration of the callback.
+
+These events delimit the outer VMM/KVM execution boundary, not hardware VM
+entry and exit.  Hardware VM exits are often handled inside KVM without a
+return to the VMM, while KVM_RUN can return without a hardware entry or exit.
+Future policy handling will restore the default-policy baseline at RUN_LEAVE.
+A custom policy may instead request a scheduling boost for VMM I/O handling;
+RUN_ENTER occurs before vCPU loading, blocking, and userspace-I/O completion so
+that policy can reconsider the request early.  Guest-execution budget
+accounting will begin only at a committed VMENTRY, not at RUN_ENTER.  Failures
+rejected before RUN_ENTER also remain outside these hooks.  KVM only reports
+the factual boundaries; pvsched owns policy and must independently cap or
+restore a future framework-managed VMM boost if KVM_RUN is rejected before
+RUN_ENTER or is never called again.  None of that policy, accounting, or
+scheduling behavior is implemented by these factual events.  Inner VM-entry,
+VM-exit, interrupt, and halt boundaries remain separate design work.
 
 Shared-page ABI
 ===============
