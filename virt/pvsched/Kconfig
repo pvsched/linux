@@ -5,5 +5,5 @@ config PVSCHED
 	help
 	  Provide the pvsched host control device.  The current implementation
 	  creates device-owned sessions and records inactive vCPU runner
-	  identities.  It does not attach shared pages, integrate with KVM, or
-	  change task scheduling.
+	  identities.  x86 KVM publishes factual architecture-run boundaries,
+	  but pvsched does not attach shared pages or change task scheduling.
