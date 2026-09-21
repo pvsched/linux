@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,7 +23,8 @@
 #define MEM_SIZE (2U * 1024 * 1024)
 #define PD_ADDR 0x2000
 #define TIMEOUT_SEC 5
-#define PLAN 8
+#define PLAN 10
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
 static int number, failures;
 
@@ -151,15 +153,277 @@ static int snapshot(int fd, struct pvsched_hook_snapshot *s)
 	return pread(fd, s, sizeof(*s), 0) == sizeof(*s) ? 0 : -1;
 }
 
-static int paired(struct pvsched_hook_snapshot *s, int ret, uint32_t reason)
+/* Mode bits that kvm_amd's AVIC or vNMI setting reports for every VM. */
+static uint32_t host_mode_flags;
+
+static int kvm_amd_param_on(const char *name)
 {
-	return s->count == 2 && !s->flags &&
-		s->records[0].event == PVSCHED_HOOK_ENTER &&
-		s->records[1].event == PVSCHED_HOOK_LEAVE &&
-		s->records[0].seq < s->records[1].seq &&
-		s->records[0].vcpu_id == s->records[1].vcpu_id &&
-		s->records[1].ret == ret &&
-		(ret || s->records[1].exit_reason == reason);
+	char path[64], value = 0;
+	int fd;
+
+	snprintf(path, sizeof(path), "/sys/module/kvm_amd/parameters/%s", name);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return 0;
+	if (read(fd, &value, 1) != 1)
+		value = 0;
+	close(fd);
+	return value == 'Y' || value == '1';
+}
+
+/* The VM reports no mode of its own beyond the host's configuration. */
+static int no_vm_mode(uint32_t mode_flags)
+{
+	return !(mode_flags & ~host_mode_flags);
+}
+
+static int zero_record(const struct pvsched_hook_record *record,
+		       unsigned int seq, uint32_t event, uint32_t event_flags)
+{
+	return record->seq == seq && record->event == event &&
+		!record->vcpu_id && !record->ret && !record->exit_reason &&
+		no_vm_mode(record->mode_flags) && record->event_flags == event_flags;
+}
+
+static int run_records(const struct pvsched_hook_snapshot *s, unsigned int first,
+		       unsigned int end, int ret, uint32_t reason)
+{
+	const struct pvsched_hook_record *record;
+	unsigned int i = first, vmexits = 0;
+	bool common_cancel = false;
+	bool vendor_open = false;
+
+	if (end - first < 2 ||
+	    !zero_record(&s->records[i], i, PVSCHED_HOOK_ENTER, 0))
+		return 0;
+	i++;
+	while (i + 1 < end) {
+		if (s->records[i].event == PVSCHED_HOOK_VMENTRY) {
+			record = &s->records[i];
+			if (record->event_flags &
+			    ~PVSCHED_HOOK_RECORD_F_INTERRUPT_READY ||
+			    !zero_record(record, i, PVSCHED_HOOK_VMENTRY,
+					 record->event_flags))
+				return 0;
+			vendor_open = true;
+			i++;
+			continue;
+		}
+
+		/* An early common cancellation has no IRQ-off terminal fact. */
+		if (s->records[i].event == PVSCHED_HOOK_VMENTRY_CANCEL) {
+			if (vendor_open ||
+			    !zero_record(&s->records[i], i,
+					 PVSCHED_HOOK_VMENTRY_CANCEL, 0))
+				return 0;
+			common_cancel = true;
+			i++;
+			continue;
+		}
+
+		if (s->records[i].event != PVSCHED_HOOK_VMEXIT_IRQOFF ||
+		    !zero_record(&s->records[i], i,
+				 PVSCHED_HOOK_VMEXIT_IRQOFF, 0))
+			return 0;
+		i++;
+		/* Only the HLT-exit fact may be set on the IRQ-on terminal fact. */
+		record = &s->records[i];
+		if (i + 1 >= end ||
+		    record->event_flags & ~PVSCHED_HOOK_RECORD_F_HLT_EXIT ||
+		    !zero_record(record, i, PVSCHED_HOOK_VMEXIT,
+				 record->event_flags))
+			return 0;
+		vmexits++;
+		vendor_open = false;
+		i++;
+	}
+
+	record = &s->records[end - 1];
+	return i == end - 1 && !vendor_open &&
+		(vmexits || common_cancel) && record->seq == end - 1 &&
+		record->event == PVSCHED_HOOK_LEAVE && !record->vcpu_id &&
+		no_vm_mode(record->mode_flags) && !record->event_flags &&
+		record->ret == ret && (ret || record->exit_reason == reason);
+}
+
+struct grammar_event {
+	uint32_t event;
+	uint32_t flags;
+};
+
+#define GRAMMAR_EVENT(_event) { .event = (_event) }
+#define GRAMMAR_EVENT_FLAGS(_event, _flags) { .event = (_event), .flags = (_flags) }
+static int grammar_vector(const struct grammar_event *events, size_t count)
+{
+	struct pvsched_hook_snapshot s = { .count = count, .next_seq = count };
+	size_t i;
+
+	if (count > ARRAY_SIZE(s.records))
+		return 0;
+	for (i = 0; i < count; i++) {
+		s.records[i].seq = i;
+		s.records[i].event = events[i].event;
+		s.records[i].event_flags = events[i].flags;
+	}
+	s.records[count - 1].exit_reason = KVM_EXIT_HLT;
+	return run_records(&s, 0, count, 0, KVM_EXIT_HLT);
+}
+
+/* A userspace HLT exit reports exactly its final VMEXIT as an HLT exit. */
+static bool run_ends_in_hlt_exit(const struct pvsched_hook_snapshot *s,
+				 unsigned int first, unsigned int end)
+{
+	unsigned int i, hlt_exits = 0;
+
+	for (i = first; i < end; i++)
+		if (s->records[i].event == PVSCHED_HOOK_VMEXIT &&
+		    s->records[i].event_flags & PVSCHED_HOOK_RECORD_F_HLT_EXIT)
+			hlt_exits++;
+	return hlt_exits == 1 && end - first >= 2 &&
+		s->records[end - 2].event == PVSCHED_HOOK_VMEXIT &&
+		s->records[end - 2].event_flags & PVSCHED_HOOK_RECORD_F_HLT_EXIT;
+}
+
+static bool run_has_vmentry(const struct pvsched_hook_snapshot *s,
+			    unsigned int first, unsigned int end)
+{
+	unsigned int i;
+
+	for (i = first; i < end; i++)
+		if (s->records[i].event == PVSCHED_HOOK_VMENTRY)
+			return true;
+	return false;
+}
+
+static int event_grammar_vectors(void)
+{
+	static const struct grammar_event synthetic[] = {
+		GRAMMAR_EVENT(PVSCHED_HOOK_ENTER),
+		GRAMMAR_EVENT(PVSCHED_HOOK_VMEXIT_IRQOFF),
+		GRAMMAR_EVENT(PVSCHED_HOOK_VMEXIT),
+		GRAMMAR_EVENT(PVSCHED_HOOK_LEAVE),
+	};
+	static const struct grammar_event fast[] = {
+		GRAMMAR_EVENT(PVSCHED_HOOK_ENTER),
+		GRAMMAR_EVENT(PVSCHED_HOOK_VMENTRY),
+		GRAMMAR_EVENT(PVSCHED_HOOK_VMENTRY),
+		GRAMMAR_EVENT(PVSCHED_HOOK_VMEXIT_IRQOFF),
+		GRAMMAR_EVENT(PVSCHED_HOOK_VMEXIT),
+		GRAMMAR_EVENT(PVSCHED_HOOK_LEAVE),
+	};
+	static const struct grammar_event early_cancel[] = {
+		GRAMMAR_EVENT(PVSCHED_HOOK_ENTER),
+		GRAMMAR_EVENT(PVSCHED_HOOK_VMENTRY_CANCEL),
+		GRAMMAR_EVENT(PVSCHED_HOOK_LEAVE),
+	};
+	static const struct grammar_event dangling_gate[] = {
+		GRAMMAR_EVENT(PVSCHED_HOOK_ENTER),
+		GRAMMAR_EVENT(PVSCHED_HOOK_VMENTRY),
+		GRAMMAR_EVENT(PVSCHED_HOOK_VMEXIT_IRQOFF),
+		GRAMMAR_EVENT(PVSCHED_HOOK_VMEXIT),
+		GRAMMAR_EVENT(PVSCHED_HOOK_VMENTRY),
+		GRAMMAR_EVENT(PVSCHED_HOOK_LEAVE),
+	};
+	static const struct grammar_event hlt_exit[] = {
+		GRAMMAR_EVENT(PVSCHED_HOOK_ENTER),
+		GRAMMAR_EVENT(PVSCHED_HOOK_VMENTRY),
+		GRAMMAR_EVENT(PVSCHED_HOOK_VMEXIT_IRQOFF),
+		GRAMMAR_EVENT_FLAGS(PVSCHED_HOOK_VMEXIT,
+				    PVSCHED_HOOK_RECORD_F_HLT_EXIT),
+		GRAMMAR_EVENT(PVSCHED_HOOK_LEAVE),
+	};
+	static const struct grammar_event unknown_exit_fact[] = {
+		GRAMMAR_EVENT(PVSCHED_HOOK_ENTER),
+		GRAMMAR_EVENT(PVSCHED_HOOK_VMENTRY),
+		GRAMMAR_EVENT(PVSCHED_HOOK_VMEXIT_IRQOFF),
+		GRAMMAR_EVENT_FLAGS(PVSCHED_HOOK_VMEXIT,
+				    PVSCHED_HOOK_RECORD_F_INTERRUPT_READY),
+		GRAMMAR_EVENT(PVSCHED_HOOK_LEAVE),
+	};
+	static const struct grammar_event mismatched_cancel[] = {
+		GRAMMAR_EVENT(PVSCHED_HOOK_ENTER),
+		GRAMMAR_EVENT(PVSCHED_HOOK_VMENTRY),
+		GRAMMAR_EVENT(PVSCHED_HOOK_VMENTRY_CANCEL),
+		GRAMMAR_EVENT(PVSCHED_HOOK_VMEXIT_IRQOFF),
+		GRAMMAR_EVENT(PVSCHED_HOOK_VMEXIT),
+		GRAMMAR_EVENT(PVSCHED_HOOK_LEAVE),
+	};
+
+	return grammar_vector(synthetic, ARRAY_SIZE(synthetic)) &&
+		grammar_vector(fast, ARRAY_SIZE(fast)) &&
+		grammar_vector(early_cancel, ARRAY_SIZE(early_cancel)) &&
+		grammar_vector(hlt_exit, ARRAY_SIZE(hlt_exit)) &&
+		!grammar_vector(unknown_exit_fact, ARRAY_SIZE(unknown_exit_fact)) &&
+		!grammar_vector(dangling_gate, ARRAY_SIZE(dangling_gate)) &&
+		!grammar_vector(mismatched_cancel, ARRAY_SIZE(mismatched_cancel));
+}
+
+static int normal_run_facts(const struct pvsched_hook_snapshot *s,
+			    int ret, uint32_t reason)
+{
+	if (s->count < 4 || s->flags || s->next_seq != s->count ||
+	    !run_records(s, 0, s->count, ret, reason))
+		return 0;
+	return run_has_vmentry(s, 0, s->count) &&
+		(ret || reason != KVM_EXIT_HLT ||
+		 run_ends_in_hlt_exit(s, 0, s->count));
+}
+
+static int repeated_run_facts(const struct pvsched_hook_snapshot *s)
+{
+	unsigned int second;
+
+	if (s->count < 10 || s->flags || s->next_seq != s->count)
+		return 0;
+	for (second = 1; second < s->count; second++) {
+		if (s->records[second - 1].event == PVSCHED_HOOK_LEAVE)
+			break;
+	}
+	return second < s->count &&
+		run_has_vmentry(s, 0, second) &&
+		run_has_vmentry(s, second, s->count) &&
+		run_records(s, 0, second, 0, KVM_EXIT_HLT) &&
+		run_records(s, second, s->count, 0, KVM_EXIT_HLT) &&
+		run_ends_in_hlt_exit(s, 0, second) &&
+		run_ends_in_hlt_exit(s, second, s->count);
+}
+
+static int halt_unhalt_facts(const struct pvsched_hook_snapshot *s)
+{
+	unsigned int i, pairs = 0;
+
+	if (s->flags || s->count < 4 ||
+	    s->records[0].event != PVSCHED_HOOK_ENTER ||
+	    s->records[s->count - 1].event != PVSCHED_HOOK_LEAVE)
+		return 0;
+	for (i = 0; i < s->count; i++) {
+		const struct pvsched_hook_record *record = &s->records[i];
+
+		if (record->seq != i || record->vcpu_id ||
+		    !no_vm_mode(record->mode_flags))
+			return 0;
+		if (record->event == PVSCHED_HOOK_HALT) {
+			if (record->event_flags || i + 1 >= s->count ||
+			    !zero_record(&s->records[i + 1], i + 1,
+					 PVSCHED_HOOK_UNHALT, 0))
+				return 0;
+			pairs++;
+			i++;
+		} else if (record->event == PVSCHED_HOOK_UNHALT) {
+			return 0;
+		}
+	}
+	return pairs > 0;
+}
+
+static int queued_nmi_fact(const struct pvsched_hook_snapshot *s)
+{
+	const struct pvsched_hook_record *record = s->records;
+
+	return s->count == 1 && !s->flags && s->next_seq == 1 &&
+		record->event == PVSCHED_HOOK_INJECT_INTR && !record->seq &&
+		!record->vcpu_id && !record->ret && !record->exit_reason &&
+		no_vm_mode(record->mode_flags) && !record->event_flags;
 }
 
 static int child_wrong_mm(struct vm *inherited)
@@ -180,7 +444,8 @@ static int child_wrong_mm(struct vm *inherited)
 			_exit(2);
 		ret = ioctl(own.vcpu, KVM_RUN, 0);
 		ok = ret == 0 && own.run->exit_reason == KVM_EXIT_HLT &&
-		     !snapshot(obs, &s) && paired(&s, 0, KVM_EXIT_HLT);
+		     !snapshot(obs, &s) &&
+		     normal_run_facts(&s, 0, KVM_EXIT_HLT);
 		ok &= !ioctl(obs, PVSCHED_HOOK_IOC_RESET, 0);
 		errno = 0;
 		ret = ioctl(inherited->vcpu, KVM_RUN, 0);
@@ -296,7 +561,7 @@ static int blocked_signal(struct vm *vm, int *unsupported)
 	struct blocked b = { .vm = vm, .observer = -1 };
 	struct stats st;
 	struct sigaction sa = { .sa_handler = handle_signal };
-	struct timespec start, deadline;
+	struct timespec deadline;
 	pthread_t thread;
 	uint64_t blocking = 0, before = 0, after = 0;
 	int joined = 0, ok = 0, ret;
@@ -323,18 +588,8 @@ static int blocked_signal(struct vm *vm, int *unsupported)
 	pthread_mutex_unlock(&b.lock);
 	if (b.ready < 0)
 		goto stop;
-	clock_gettime(CLOCK_MONOTONIC, &start);
-	for (;;) {
-		struct timespec now;
-
-		if (stat_read(&st, st.blocking, &blocking) || blocking == 1)
-			break;
-		clock_gettime(CLOCK_MONOTONIC, &now);
-		if (now.tv_sec - start.tv_sec >= TIMEOUT_SEC)
-			break;
-		sched_yield();
-	}
-	if (blocking != 1 || pthread_kill(thread, SIGUSR1))
+	if (ioctl(b.observer, PVSCHED_HOOK_IOC_WAIT_HALT, 0) ||
+	    pthread_kill(thread, SIGUSR1))
 		goto stop;
 	clock_gettime(CLOCK_REALTIME, &deadline);
 	deadline.tv_sec += TIMEOUT_SEC;
@@ -346,7 +601,7 @@ static int blocked_signal(struct vm *vm, int *unsupported)
 	if (st.halt_wait >= 0 && stat_read(&st, st.halt_wait, &after))
 		goto out;
 	ok = b.ret < 0 && b.error == EINTR && !blocking &&
-	     paired(&b.snapshot, -EINTR, 0) &&
+	     halt_unhalt_facts(&b.snapshot) &&
 	     (st.halt_wait < 0 || after > before);
 	goto out;
 stop:
@@ -369,6 +624,10 @@ int main(void)
 
 	setvbuf(stdout, NULL, _IONBF, 0);
 	printf("TAP version 13\n");
+	if (kvm_amd_param_on("avic"))
+		host_mode_flags |= PVSCHED_HOOK_MODE_SVM_AVIC;
+	if (kvm_amd_param_on("vnmi"))
+		host_mode_flags |= PVSCHED_HOOK_MODE_SVM_VNMI;
 	alarm(60);
 	observer = open("/dev/" PVSCHED_HOOK_OBSERVER_DEVICE,
 			O_RDWR | O_CLOEXEC);
@@ -394,6 +653,8 @@ int main(void)
 		return 1;
 	}
 	printf("1..%d\n", PLAN);
+	result(event_grammar_vectors(),
+	       "event grammar accepts legal return and common cancellation forms");
 	pol1 = sched_getscheduler(0);
 	sched_ok = pol1 >= 0 && !sched_getparam(0, &sp1);
 	errno = 0;
@@ -402,26 +663,14 @@ int main(void)
 	ret = ioctl(observer, PVSCHED_HOOK_IOC_RESET, 0) || reset_rip(&vm);
 	ret = ret ?: ioctl(vm.vcpu, KVM_RUN, 0);
 	result(!ret && vm.run->exit_reason == KVM_EXIT_HLT &&
-	       !snapshot(observer, &s) && paired(&s, 0, KVM_EXIT_HLT),
-	       "userspace HLT exit has one ordered pair");
+	       !snapshot(observer, &s) && normal_run_facts(&s, 0, KVM_EXIT_HLT),
+	       "normal HLT run has exact factual event order and arguments");
 
 	ret = ioctl(observer, PVSCHED_HOOK_IOC_RESET, 0) || reset_rip(&vm);
 	ret = ret ?: ioctl(vm.vcpu, KVM_RUN, 0);
 	ret = ret ?: reset_rip(&vm);
 	ret = ret ?: ioctl(vm.vcpu, KVM_RUN, 0);
-	result(!ret && !snapshot(observer, &s) && s.count == 4 && !s.flags &&
-	       s.records[0].event == PVSCHED_HOOK_ENTER &&
-	       s.records[1].event == PVSCHED_HOOK_LEAVE && !s.records[1].ret &&
-	       s.records[1].exit_reason == KVM_EXIT_HLT &&
-	       s.records[2].event == PVSCHED_HOOK_ENTER &&
-	       s.records[3].event == PVSCHED_HOOK_LEAVE && !s.records[3].ret &&
-	       s.records[3].exit_reason == KVM_EXIT_HLT &&
-	       s.records[0].vcpu_id == s.records[1].vcpu_id &&
-	       s.records[0].vcpu_id == s.records[2].vcpu_id &&
-	       s.records[0].vcpu_id == s.records[3].vcpu_id &&
-	       s.records[0].seq < s.records[1].seq &&
-	       s.records[1].seq < s.records[2].seq &&
-	       s.records[2].seq < s.records[3].seq,
+	result(!ret && !snapshot(observer, &s) && repeated_run_facts(&s),
 	       "repeated runs remain sequential and balanced");
 
 	ret = ioctl(vm.kvm, KVM_CHECK_EXTENSION, KVM_CAP_IMMEDIATE_EXIT);
@@ -437,7 +686,14 @@ int main(void)
 			ret = ioctl(vm.vcpu, KVM_RUN, 0);
 		vm.run->immediate_exit = 0;
 		result(ret < 0 && errno == EINTR && !snapshot(observer, &s) &&
-		       paired(&s, -EINTR, 0), "immediate_exit has a pair");
+		       s.count == 2 && !s.flags && s.next_seq == 2 &&
+		       s.records[0].seq == 0 && s.records[0].event == PVSCHED_HOOK_ENTER &&
+		       !s.records[0].vcpu_id && no_vm_mode(s.records[0].mode_flags) &&
+		       !s.records[0].event_flags && s.records[1].seq == 1 &&
+		       s.records[1].event == PVSCHED_HOOK_LEAVE &&
+		       !s.records[1].vcpu_id && no_vm_mode(s.records[1].mode_flags) &&
+		       !s.records[1].event_flags && s.records[1].ret == -EINTR,
+		       "immediate_exit preserves the outer RUN pair");
 	}
 
 	ret = ioctl(observer, PVSCHED_HOOK_IOC_RESET, 0);
@@ -455,7 +711,10 @@ int main(void)
 		ret = ioctl(vm.vcpu, KVM_RUN, 0);
 	vm.run->kvm_valid_regs = 0;
 	result(ret < 0 && errno == EINVAL && !snapshot(observer, &s) &&
-	       paired(&s, -EINVAL, 0),
+	       s.count == 2 && !s.flags && s.next_seq == 2 &&
+	       s.records[0].seq == 0 && s.records[0].event == PVSCHED_HOOK_ENTER &&
+	       s.records[1].seq == 1 && s.records[1].event == PVSCHED_HOOK_LEAVE &&
+	       s.records[1].ret == -EINVAL,
 	       "invalid x86 run state has a complete error pair");
 
 	ret = ioctl(observer, PVSCHED_HOOK_IOC_RESET, 0);
@@ -477,7 +736,7 @@ int main(void)
 
 	ret = ioctl(vm.kvm, KVM_CHECK_EXTENSION, KVM_CAP_IRQCHIP);
 	if (!ret) {
-		skip("signal interrupts a blocked HLT run", "irqchip unavailable");
+		skip("signal balances a HLT block attempt", "irqchip unavailable");
 	} else if (ret < 0) {
 		result(0, "query in-kernel irqchip capability");
 	} else {
@@ -485,11 +744,31 @@ int main(void)
 		if (!ret)
 			ret = blocked_signal(&blocked, &unsupported);
 		if (!ret && unsupported)
-			skip("signal interrupts a blocked HLT run",
+			skip("signal balances a HLT block attempt",
 			     "binary vCPU statistics unavailable");
 		else
-			result(ret == 1, "signal interrupts a blocked HLT run");
+			result(ret == 1, "signal balances a HLT block attempt");
 		vm_close(&blocked);
+	}
+	observer = open("/dev/" PVSCHED_HOOK_OBSERVER_DEVICE,
+			O_RDWR | O_CLOEXEC);
+	if (observer < 0) {
+		result(0, "reopen observer for queued NMI fact");
+	} else {
+		ret = ioctl(vm.kvm, KVM_CHECK_EXTENSION, KVM_CAP_USER_NMI);
+		if (ret < 0) {
+			result(0, "query user NMI capability");
+		} else if (!ret) {
+			skip("queued NMI emits one interrupt fact",
+			     "user NMI unavailable");
+		} else {
+			ret = ioctl(observer, PVSCHED_HOOK_IOC_RESET, 0);
+			if (!ret)
+				ret = ioctl(vm.vcpu, KVM_NMI, 0);
+			result(!ret && !snapshot(observer, &s) && queued_nmi_fact(&s),
+			       "queued NMI emits one interrupt fact");
+		}
+		close(observer);
 	}
 	vm_close(&vm);
 	return failures || number != PLAN;
