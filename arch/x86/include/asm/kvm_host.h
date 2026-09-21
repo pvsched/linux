@@ -1869,6 +1869,11 @@ struct kvm_x86_ops {
 	int (*vcpu_pre_run)(struct kvm_vcpu *vcpu);
 	enum exit_fastpath_completion (*vcpu_run)(struct kvm_vcpu *vcpu,
 						  u64 run_flags);
+#if IS_ENABLED(CONFIG_PVSCHED)
+	u32 (*pvsched_get_mode_flags)(struct kvm_vcpu *vcpu);
+	bool (*pvsched_is_hlt_exit)(struct kvm_vcpu *vcpu);
+	bool (*pvsched_interrupt_ready)(struct kvm_vcpu *vcpu, u32 mode_flags);
+#endif
 	int (*handle_exit)(struct kvm_vcpu *vcpu,
 		enum exit_fastpath_completion exit_fastpath);
 	int (*skip_emulated_instruction)(struct kvm_vcpu *vcpu);

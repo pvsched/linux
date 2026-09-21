@@ -5,7 +5,8 @@ Paravirtualized scheduling (pvsched)
 ====================================
 
 :Author: Vineeth Pillai
-:Status: ABI, inactive control, request/accounting cores, and KVM_RUN hooks
+:Status: ABI, inactive control, request/accounting cores, and factual KVM
+         run/inner hooks
 
 Overview
 ========
@@ -23,9 +24,9 @@ thread.  The framework, policy implementations, KVM event sources, transport,
 and lifecycle interfaces are deliberately separate from the shared-page ABI.
 
 The ABI version 1 shared-page representation, deterministic budget arithmetic,
-built-in request selection, and an inactive runner-identity control plane are
-defined at this stage.  There is no page attachment, transport binding,
-scheduler interface, or runtime pvsched implementation yet.
+built-in request selection, an inactive runner-identity control plane, and
+factual KVM run and inner-loop hooks are defined at this stage.  There is no
+shared-page attachment, transport binding, or active pvsched runtime yet.
 
 Architecture
 ============
@@ -43,10 +44,10 @@ The planned design has four components:
   policies return requests for framework service, while explicitly selected
   policy-managed bindings own their scheduling and throttling behavior.
 
-x86 KVM provides factual architecture-run boundary events, but does not own policy
-selection, shared-page negotiation, or boost accounting.  Runtime interfaces
-and inner guest-entry/exit ordering remain future implementation work and are
-not implied by the ABI definitions.
+x86 KVM provides factual architecture-run and inner guest-entry/exit events,
+but does not own policy selection, shared-page negotiation, or boost
+accounting.  The KVM hooks are prerequisites only: no active runtime
+currently binds them to the shared-page ABI.
 
 Budget accounting core
 ======================
@@ -134,18 +135,20 @@ include reservations for opens and creates still in flight, so concurrent
 operations cannot transiently exceed the advertised limits.  Failed operations
 return their reservations; published runners retain quota until final close.
 
-x86 KVM run boundaries
-======================
+x86 KVM factual boundaries
+==========================
 
-x86 KVM declares bare ``kvm_pvsched_run_enter`` and
-``kvm_pvsched_run_leave`` hooks, whose generated tracepoint symbols carry the
-``_tp`` suffix, around ``kvm_arch_vcpu_ioctl_run()``.  Generic KVM has already
-validated the ioctl argument and updated the runner pid, and x86 KVM has
-completed MMU post-initialization, before entry.  Leave occurs on every
+x86 KVM calls ``kvm_pvsched_run_enter`` and ``kvm_pvsched_run_leave`` wrappers
+around ``kvm_arch_vcpu_ioctl_run()``.  The underlying hooks are bare
+tracepoints declared in ``include/trace/events/kvm_pvsched.h``; their symbols
+carry the ``_tp`` suffix, and x86 KVM defines and exports them.  Generic
+KVM has already validated the ioctl argument and updated the runner pid, and
+x86 KVM has completed MMU post-initialization, before entry.  Leave occurs on every
 architecture-run path after entry and reports the signed result plus a raw
-exit-reason snapshot.  The exit reason is useful when the result is zero, but
-remains userspace-writable and untrusted and does not prove guest entry.
-Consumers must ignore it when the result is negative.
+exit-reason snapshot.  Entry also reports the current mode flags described
+below.  The exit reason is useful when the result is zero, but remains
+userspace-writable and untrusted and does not prove guest entry.  Consumers
+must ignore it when the result is negative.
 
 Generic failures, including invalid arguments, and MMU post-initialization
 failures publish neither event.  A complete pair does not prove that guest
@@ -161,13 +164,93 @@ Future policy handling will restore the default-policy baseline at RUN_LEAVE.
 A custom policy may instead request a scheduling boost for VMM I/O handling;
 RUN_ENTER occurs before vCPU loading, blocking, and userspace-I/O completion so
 that policy can reconsider the request early.  Guest-execution budget
-accounting will begin only at a committed VMENTRY, not at RUN_ENTER.  Failures
-rejected before RUN_ENTER also remain outside these hooks.  KVM only reports
-the factual boundaries; pvsched owns policy and must independently cap or
-restore a future framework-managed VMM boost if KVM_RUN is rejected before
-RUN_ENTER or is never called again.  None of that policy, accounting, or
-scheduling behavior is implemented by these factual events.  Inner VM-entry,
-VM-exit, interrupt, and halt boundaries remain separate design work.
+accounting will begin at the late VMENTRY-attempt boundary, not at RUN_ENTER,
+and will conservatively include a failed hardware entry.  Failures rejected
+before RUN_ENTER also remain outside these hooks.  KVM only reports the factual
+boundaries; pvsched owns policy and must independently cap or restore a future
+framework-managed VMM boost if KVM_RUN is rejected before RUN_ENTER or is never
+called again.  None of that policy, accounting, or scheduling behavior is
+implemented by these factual events.
+
+The inner hooks report these additional facts:
+
+* ``kvm_pvsched_vmentry`` reports an entry attempt at the latest vendor point
+  that needs no hardware-state rollback.  It carries fresh mode flags and
+  target-side interrupt eligibility, which the vendor module reports through
+  its ``pvsched_interrupt_ready`` operation.  The callback cannot veto entry
+  or change ``vcpu->mode``.  On both VMX and SVM, the interval from VMENTRY
+  to its terminal IRQ-off fact includes the bounded LAPIC timer-advance
+  wait; VMX also includes PT/perf preparation.  The wait is capped at 5
+  microseconds.
+* ``kvm_pvsched_vmexit_irqoff`` reports the terminal accounting fact after
+  host PKRU has been restored and before host interrupts are enabled for every
+  vendor return.  A VMEXIT fact does not prove that hardware entry occurred
+  because vendor code can return without entering the guest; synthetic VMX
+  and SVM returns use the same terminal path even if no VMENTRY fact occurred.
+* ``kvm_pvsched_vmexit`` reports the slow reconciliation checkpoint after
+  host interrupts are enabled and before preemption is enabled.
+  The fact also reports whether the exit is a non-nested ``HLT`` exit,
+  whether or not KVM has handled it yet, so a consumer can keep a halting
+  vCPU boosted until it blocks.
+  ``kvm_pvsched_vmentry_cancel`` reports the equivalent checkpoint for a
+  common request cancellation before KVM calls the vendor.  Such a
+  cancellation has no matching IRQ-off event because there was no vendor
+  return.
+* ``kvm_pvsched_vcpu_halt`` and ``kvm_pvsched_vcpu_unhalt`` bracket an actual
+  x86 halted-vCPU call to ``schedule()``.  Wait-for-SIPI and other generic KVM
+  blocking states do not emit them.
+* ``kvm_pvsched_vcpu_inject_intr`` reports an accepted fixed/lowest-priority
+  LAPIC interrupt or queued NMI.  It is a wake opportunity, not proof that the
+  guest handled the interrupt.
+
+VMENTRY facts are not paired one-for-one with terminal facts.  A fast loop can
+publish multiple VMENTRY attempts before one terminal pair.  Conversely, a
+common cancellation before vendor entry publishes only the IRQ-on
+VMENTRY_CANCEL fact.  A future pvsched consumer must therefore retain its own
+epoch state; a stop on a closed epoch is a no-op, while a terminal fact closes
+an epoch opened by an earlier fast attempt.
+
+The mode-sensitive entry, exit, halt and injection hooks report fresh internal
+mode flags.  RUN_LEAVE retains its result and exit-reason fields.  The flags
+are factual and combinable; they do not select a policy or a single execution
+mode.  They identify nested execution, confidential or encrypted-memory
+execution, configured SVM AVIC, configured SVM virtual NMI and VMX software
+real mode.  The early and remote paths use only state that is safe to sample
+without reading a remote VMCS.  VMENTRY additionally examines prepared
+hardware injection state on the target CPU.  The flags remain facts for a
+pvsched consumer to act on; KVM does not enforce pvsched policy.  SVM
+reports PROTECTED for SEV, SEV-ES and SNP; VMX reports it for TDX, including a
+debug TDX guest.
+
+``interrupt_ready`` means that the next hardware attempt has a prepared
+external interrupt or NMI opportunity.  VMX also recognizes an eligible L1
+virtual-interrupt-delivery candidate after PIR synchronization, including an
+older IRR candidate, when interrupt-window exiting is disabled and IF,
+interrupt shadow and APIC priority allow it.
+Nested, protected, VMX software-real-mode and configured SVM AVIC/vNMI cases
+report false.  This is neither interrupt-handler entry nor delivery proof.
+
+There is no special VMENTRY hook inside the TDX run path.  The VMM must reject
+pvsched for confidential guests, and RUN_ENTER plus every fresh boost-source
+fact reports PROTECTED so a consumer can fail closed.  Attachment itself must
+not boost.  A temporary mid-run active attachment before the next factual hook
+can therefore remain at baseline; that attachment sequence is unsupported.
+
+Posted-interrupt coverage is deliberately incomplete.  An interrupt posted to
+an already-running guest normally relies on the guest critical-section signal;
+the host accepts the small race in which the guest exits before reaching its
+instrumented handler.  Direct device or IOMMU posting to an already-runnable
+vCPU that the host has descheduled may execute no KVM producer callback, so no
+fact can accelerate that initial host runqueue wait.  Target-side eligibility
+is still reported when the vCPU is selected and prepares to enter.
+
+VMX software-assisted real mode reports the mode bit but does not report an
+IRQ/NMI handoff opportunity.  Real mode with unrestricted guest remains in the
+ordinary supported VMX path.  The software-assisted case is deferred because
+its event injection is emulated outside the hardware-entry contract above.
+
+All callbacks run synchronously, must not sleep and borrow the vCPU pointer
+only for their duration.  They are not dispatched from host NMI context.
 
 Shared-page ABI
 ===============
