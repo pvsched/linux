@@ -41,6 +41,7 @@
 #include <asm/idtentry.h>
 #include <asm/io.h>
 #include <asm/irq_remapping.h>
+#include <asm/kvm_pvsched.h>
 #include <asm/reboot.h>
 #include <asm/perf_event.h>
 #include <asm/mmu_context.h>
@@ -6967,6 +6968,43 @@ int vmx_sync_pir_to_irr(struct kvm_vcpu *vcpu)
 	return max_irr;
 }
 
+#if IS_ENABLED(CONFIG_PVSCHED)
+bool vmx_pvsched_interrupt_ready(struct kvm_vcpu *vcpu, u32 mode_flags)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	u32 intr_info;
+	u8 ppr, rvi;
+
+	if (mode_flags & (KVM_PVSCHED_MODE_NESTED |
+			  KVM_PVSCHED_MODE_PROTECTED |
+			  KVM_PVSCHED_MODE_VMX_SW_RMODE))
+		return false;
+	if (READ_ONCE(vmx->vt.emulation_required))
+		return false;
+
+	intr_info = vmcs_read32(VM_ENTRY_INTR_INFO_FIELD);
+	if (intr_info & INTR_INFO_VALID_MASK) {
+		intr_info &= INTR_INFO_INTR_TYPE_MASK;
+		return intr_info == INTR_TYPE_EXT_INTR ||
+		       intr_info == INTR_TYPE_NMI_INTR;
+	}
+
+	if (!kvm_vcpu_apicv_active(vcpu) ||
+	    (exec_controls_get(vmx) & CPU_BASED_INTR_WINDOW_EXITING) ||
+	    !(secondary_exec_controls_get(vmx) &
+	      SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY) ||
+	    !(vmx_get_rflags(vcpu) & X86_EFLAGS_IF) ||
+	    /* Single-step entry clears STI/MOV-SS blocking before hardware entry. */
+	    (!(vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) &&
+	     vmx_get_interrupt_shadow(vcpu)))
+		return false;
+
+	rvi = vmx_get_rvi();
+	ppr = kvm_lapic_get_reg(vcpu->arch.apic, APIC_PROCPRI);
+	return (rvi & 0xf0) > (ppr & 0xf0);
+}
+#endif
+
 void vmx_load_eoi_exitmap(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap)
 {
 	if (!kvm_vcpu_apicv_active(vcpu))
@@ -7446,6 +7484,8 @@ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
 	 * case. */
 	if (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP)
 		vmx_set_interrupt_shadow(vcpu, 0);
+
+	kvm_pvsched_vmentry(vcpu);
 
 	kvm_load_guest_xsave_state(vcpu);
 

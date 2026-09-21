@@ -35,6 +35,7 @@
 #include <asm/current.h>
 #include <asm/apicdef.h>
 #include <asm/delay.h>
+#include <asm/kvm_pvsched.h>
 #include <linux/atomic.h>
 #include <linux/jump_label.h>
 #include "kvm_cache_regs.h"
@@ -1445,6 +1446,7 @@ static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
 				apic_clear_vector(vector, apic->regs + APIC_TMR);
 		}
 
+		kvm_pvsched_vcpu_inject_intr(vcpu);
 		kvm_x86_call(deliver_interrupt)(apic, delivery_mode,
 						trig_mode, vector);
 		break;

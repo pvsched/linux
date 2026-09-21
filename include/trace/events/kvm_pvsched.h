@@ -20,12 +20,41 @@ struct kvm_vcpu;
 
 #if IS_ENABLED(CONFIG_PVSCHED)
 DECLARE_TRACE(kvm_pvsched_run_enter,
-	      TP_PROTO(struct kvm_vcpu *vcpu),
-	      TP_ARGS(vcpu));
+	      TP_PROTO(struct kvm_vcpu *vcpu, u32 mode_flags),
+	      TP_ARGS(vcpu, mode_flags));
 
 DECLARE_TRACE(kvm_pvsched_run_leave,
 	      TP_PROTO(struct kvm_vcpu *vcpu, int ret, u32 exit_reason),
 	      TP_ARGS(vcpu, ret, exit_reason));
+
+DECLARE_TRACE(kvm_pvsched_vmentry,
+	      TP_PROTO(struct kvm_vcpu *vcpu, u32 mode_flags,
+		       bool interrupt_ready),
+	      TP_ARGS(vcpu, mode_flags, interrupt_ready));
+
+DECLARE_TRACE(kvm_pvsched_vmexit_irqoff,
+	      TP_PROTO(struct kvm_vcpu *vcpu),
+	      TP_ARGS(vcpu));
+
+DECLARE_TRACE(kvm_pvsched_vmexit,
+	      TP_PROTO(struct kvm_vcpu *vcpu, u32 mode_flags, bool hlt_exit),
+	      TP_ARGS(vcpu, mode_flags, hlt_exit));
+
+DECLARE_TRACE(kvm_pvsched_vmentry_cancel,
+	      TP_PROTO(struct kvm_vcpu *vcpu, u32 mode_flags),
+	      TP_ARGS(vcpu, mode_flags));
+
+DECLARE_TRACE(kvm_pvsched_vcpu_halt,
+	      TP_PROTO(struct kvm_vcpu *vcpu, u32 mode_flags),
+	      TP_ARGS(vcpu, mode_flags));
+
+DECLARE_TRACE(kvm_pvsched_vcpu_unhalt,
+	      TP_PROTO(struct kvm_vcpu *vcpu, u32 mode_flags),
+	      TP_ARGS(vcpu, mode_flags));
+
+DECLARE_TRACE(kvm_pvsched_vcpu_inject_intr,
+	      TP_PROTO(struct kvm_vcpu *vcpu, u32 mode_flags),
+	      TP_ARGS(vcpu, mode_flags));
 #endif
 
 #endif /* _TRACE_KVM_PVSCHED_H */

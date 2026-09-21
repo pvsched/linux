@@ -77,7 +77,7 @@ out:
 	spin_unlock_irqrestore(&obs.lock, irqflags);
 }
 
-static void obs_enter(void *data, struct kvm_vcpu *vcpu)
+static void obs_enter(void *data, struct kvm_vcpu *vcpu, u32 mode_flags)
 {
 	obs_record(PVSCHED_HOOK_ENTER, vcpu, 0, 0);
 }

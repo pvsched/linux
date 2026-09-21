@@ -995,10 +995,23 @@ void kvm_inject_emulated_page_fault(struct kvm_vcpu *vcpu,
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_inject_emulated_page_fault);
 
 #if IS_ENABLED(CONFIG_PVSCHED)
+static u32 kvm_pvsched_get_mode_flags(struct kvm_vcpu *vcpu)
+{
+	u32 mode_flags = kvm_x86_call(pvsched_get_mode_flags)(vcpu);
+
+	if (READ_ONCE(vcpu->arch.hflags) & HF_GUEST_MASK)
+		mode_flags |= KVM_PVSCHED_MODE_NESTED;
+	if (READ_ONCE(vcpu->arch.guest_state_protected))
+		mode_flags |= KVM_PVSCHED_MODE_PROTECTED;
+
+	return mode_flags;
+}
+
 void kvm_pvsched_run_enter(struct kvm_vcpu *vcpu)
 {
 	if (trace_kvm_pvsched_run_enter_tp_enabled())
-		trace_kvm_pvsched_run_enter_tp(vcpu);
+		trace_kvm_pvsched_run_enter_tp(vcpu,
+					       kvm_pvsched_get_mode_flags(vcpu));
 }
 
 void kvm_pvsched_run_leave(struct kvm_vcpu *vcpu, int ret)
@@ -1007,12 +1020,74 @@ void kvm_pvsched_run_leave(struct kvm_vcpu *vcpu, int ret)
 		trace_kvm_pvsched_run_leave_tp(vcpu, ret,
 					       READ_ONCE(vcpu->run->exit_reason));
 }
+
+void __kvm_pvsched_vmentry(struct kvm_vcpu *vcpu)
+{
+	u32 mode_flags;
+	bool ready;
+
+	mode_flags = kvm_pvsched_get_mode_flags(vcpu);
+	ready = kvm_x86_call(pvsched_interrupt_ready)(vcpu, mode_flags);
+	trace_kvm_pvsched_vmentry_tp(vcpu, mode_flags, ready);
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(__kvm_pvsched_vmentry);
+
+void kvm_pvsched_vmentry_cancel(struct kvm_vcpu *vcpu)
+{
+	if (trace_kvm_pvsched_vmentry_cancel_tp_enabled())
+		trace_kvm_pvsched_vmentry_cancel_tp(vcpu,
+						    kvm_pvsched_get_mode_flags(vcpu));
+}
+
+void kvm_pvsched_vmexit_irqoff(struct kvm_vcpu *vcpu)
+{
+	trace_kvm_pvsched_vmexit_irqoff_tp(vcpu);
+}
+
+void kvm_pvsched_vmexit(struct kvm_vcpu *vcpu)
+{
+	u32 mode_flags;
+
+	if (!trace_kvm_pvsched_vmexit_tp_enabled())
+		return;
+
+	mode_flags = kvm_pvsched_get_mode_flags(vcpu);
+	trace_kvm_pvsched_vmexit_tp(vcpu, mode_flags,
+				    kvm_x86_call(pvsched_is_hlt_exit)(vcpu));
+}
+
+/* Only a halted vCPU's sleep is a pvsched HALT; Wait-for-SIPI is not. */
+bool kvm_arch_vcpu_block_sleep(struct kvm_vcpu *vcpu)
+{
+	if (READ_ONCE(vcpu->arch.mp_state) != KVM_MP_STATE_HALTED)
+		return false;
+
+	if (trace_kvm_pvsched_vcpu_halt_tp_enabled())
+		trace_kvm_pvsched_vcpu_halt_tp(vcpu,
+					       kvm_pvsched_get_mode_flags(vcpu));
+	return true;
+}
+
+void kvm_arch_vcpu_block_wake(struct kvm_vcpu *vcpu)
+{
+	if (trace_kvm_pvsched_vcpu_unhalt_tp_enabled())
+		trace_kvm_pvsched_vcpu_unhalt_tp(vcpu,
+						 kvm_pvsched_get_mode_flags(vcpu));
+}
+
+void kvm_pvsched_vcpu_inject_intr(struct kvm_vcpu *vcpu)
+{
+	if (trace_kvm_pvsched_vcpu_inject_intr_tp_enabled())
+		trace_kvm_pvsched_vcpu_inject_intr_tp(vcpu,
+						      kvm_pvsched_get_mode_flags(vcpu));
+}
 #endif
 
 void kvm_inject_nmi(struct kvm_vcpu *vcpu)
 {
 	atomic_inc(&vcpu->arch.nmi_queued);
 	kvm_make_request(KVM_REQ_NMI, vcpu);
+	kvm_pvsched_vcpu_inject_intr(vcpu);
 }
 
 void kvm_queue_exception_e(struct kvm_vcpu *vcpu, unsigned nr, u32 error_code)
@@ -10929,6 +11004,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 		vcpu->mode = OUTSIDE_GUEST_MODE;
 		smp_wmb();
 		local_irq_enable();
+		kvm_pvsched_vmentry_cancel(vcpu);
 		preempt_enable();
 		kvm_vcpu_srcu_read_lock(vcpu);
 		r = 1;
@@ -11003,6 +11079,8 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 		/* Note, VM-Exits that go down the "slow" path are accounted below. */
 		++vcpu->stat.exits;
 	}
+
+	kvm_pvsched_vmexit_irqoff(vcpu);
 
 	/*
 	 * Do this here before restoring debug registers on the host.  And
@@ -11079,6 +11157,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 	guest_timing_exit_irqoff();
 
 	local_irq_enable();
+	kvm_pvsched_vmexit(vcpu);
 	preempt_enable();
 
 	kvm_vcpu_srcu_read_lock(vcpu);
@@ -13679,6 +13758,13 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_rmp_fault);
 #if IS_ENABLED(CONFIG_PVSCHED)
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_pvsched_run_enter_tp);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_pvsched_run_leave_tp);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_pvsched_vmentry_tp);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_pvsched_vmexit_irqoff_tp);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_pvsched_vmexit_tp);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_pvsched_vmentry_cancel_tp);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_pvsched_vcpu_halt_tp);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_pvsched_vcpu_unhalt_tp);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_pvsched_vcpu_inject_intr_tp);
 #endif
 
 static int __init kvm_x86_init(void)

@@ -38,6 +38,7 @@
 #include <asm/desc.h>
 #include <asm/debugreg.h>
 #include <asm/kvm_para.h>
+#include <asm/kvm_pvsched.h>
 #include <asm/irq_remapping.h>
 #include <asm/spec-ctrl.h>
 #include <asm/cpu_device_id.h>
@@ -4235,6 +4236,54 @@ static int svm_vcpu_pre_run(struct kvm_vcpu *vcpu)
 	return 1;
 }
 
+#if IS_ENABLED(CONFIG_PVSCHED)
+static u32 svm_pvsched_get_mode_flags(struct kvm_vcpu *vcpu)
+{
+	u32 mode_flags = 0;
+
+	/*
+	 * A remote wake can race SEV context transfer and see either the old or
+	 * new state.  RUN_ENTER is serialized by the vCPU mutex, and the target
+	 * VMENTRY gate resamples this hint before supported guest execution.
+	 */
+	if (data_race(sev_guest(vcpu->kvm)))
+		mode_flags |= KVM_PVSCHED_MODE_PROTECTED;
+	if (enable_apicv && irqchip_in_kernel(vcpu->kvm))
+		mode_flags |= KVM_PVSCHED_MODE_SVM_AVIC;
+	if (vnmi)
+		mode_flags |= KVM_PVSCHED_MODE_SVM_VNMI;
+
+	return mode_flags;
+}
+
+static bool svm_pvsched_is_hlt_exit(struct kvm_vcpu *vcpu)
+{
+	if (is_guest_mode(vcpu))
+		return false;
+
+	return to_svm(vcpu)->vmcb->control.exit_code == SVM_EXIT_HLT;
+}
+
+static bool svm_pvsched_interrupt_ready(struct kvm_vcpu *vcpu, u32 mode_flags)
+{
+	u32 event_inj;
+
+	if (mode_flags & (KVM_PVSCHED_MODE_NESTED |
+			  KVM_PVSCHED_MODE_PROTECTED |
+			  KVM_PVSCHED_MODE_SVM_AVIC |
+			  KVM_PVSCHED_MODE_SVM_VNMI))
+		return false;
+
+	event_inj = READ_ONCE(to_svm(vcpu)->vmcb->control.event_inj);
+	if (!(event_inj & SVM_EVTINJ_VALID))
+		return false;
+
+	event_inj &= SVM_EVTINJ_TYPE_MASK;
+	return event_inj == SVM_EVTINJ_TYPE_INTR ||
+	       event_inj == SVM_EVTINJ_TYPE_NMI;
+}
+#endif
+
 static fastpath_t svm_exit_handlers_fastpath(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_svm *svm = to_svm(vcpu);
@@ -4357,6 +4406,8 @@ static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
 		svm_set_dr6(vcpu, vcpu->arch.dr6);
 	else if (likely(!(vcpu->arch.switch_db_regs & KVM_DEBUGREG_WONT_EXIT)))
 		svm_set_dr6(vcpu, DR6_ACTIVE_LOW);
+
+	kvm_pvsched_vmentry(vcpu);
 
 	clgi();
 	kvm_load_guest_xsave_state(vcpu);
@@ -5197,6 +5248,11 @@ struct kvm_x86_ops svm_x86_ops __initdata = {
 
 	.vcpu_pre_run = svm_vcpu_pre_run,
 	.vcpu_run = svm_vcpu_run,
+#if IS_ENABLED(CONFIG_PVSCHED)
+	.pvsched_get_mode_flags = svm_pvsched_get_mode_flags,
+	.pvsched_is_hlt_exit = svm_pvsched_is_hlt_exit,
+	.pvsched_interrupt_ready = svm_pvsched_interrupt_ready,
+#endif
 	.handle_exit = svm_handle_exit,
 	.skip_emulated_instruction = svm_skip_emulated_instruction,
 	.update_emulated_instruction = NULL,

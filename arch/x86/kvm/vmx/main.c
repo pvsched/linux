@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/moduleparam.h>
 
+#include <asm/kvm_pvsched.h>
+
 #include "x86_ops.h"
 #include "vmx.h"
 #include "mmu.h"
@@ -847,6 +849,34 @@ static int vt_gmem_max_mapping_level(struct kvm *kvm, kvm_pfn_t pfn,
 #define vt_op_tdx_only(name) NULL
 #endif /* CONFIG_KVM_INTEL_TDX */
 
+#if IS_ENABLED(CONFIG_PVSCHED)
+static u32 vt_pvsched_get_mode_flags(struct kvm_vcpu *vcpu)
+{
+	if (is_td_vcpu(vcpu))
+		return KVM_PVSCHED_MODE_PROTECTED;
+
+	return READ_ONCE(to_vmx(vcpu)->rmode.vm86_active) ?
+		KVM_PVSCHED_MODE_VMX_SW_RMODE : 0;
+}
+
+static bool vt_pvsched_is_hlt_exit(struct kvm_vcpu *vcpu)
+{
+	/* A TD halts through a TDVMCALL, and pvsched does not serve TDs. */
+	if (is_td_vcpu(vcpu) || is_guest_mode(vcpu))
+		return false;
+
+	return vmx_get_exit_reason(vcpu).basic == EXIT_REASON_HLT;
+}
+
+static bool vt_pvsched_interrupt_ready(struct kvm_vcpu *vcpu, u32 mode_flags)
+{
+	if (is_td_vcpu(vcpu))
+		return false;
+
+	return vmx_pvsched_interrupt_ready(vcpu, mode_flags);
+}
+#endif
+
 #define VMX_REQUIRED_APICV_INHIBITS				\
 	(BIT(APICV_INHIBIT_REASON_DISABLED) |			\
 	 BIT(APICV_INHIBIT_REASON_ABSENT) |			\
@@ -920,6 +950,11 @@ struct kvm_x86_ops vt_x86_ops __initdata = {
 
 	.vcpu_pre_run = vt_op(vcpu_pre_run),
 	.vcpu_run = vt_op(vcpu_run),
+#if IS_ENABLED(CONFIG_PVSCHED)
+	.pvsched_get_mode_flags = vt_pvsched_get_mode_flags,
+	.pvsched_is_hlt_exit = vt_pvsched_is_hlt_exit,
+	.pvsched_interrupt_ready = vt_pvsched_interrupt_ready,
+#endif
 	.handle_exit = vt_op(handle_exit),
 	.skip_emulated_instruction = vmx_skip_emulated_instruction,
 	.update_emulated_instruction = vmx_update_emulated_instruction,
