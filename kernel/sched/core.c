@@ -102,6 +102,7 @@
 
 EXPORT_TRACEPOINT_SYMBOL_GPL(ipi_send_cpu);
 EXPORT_TRACEPOINT_SYMBOL_GPL(ipi_send_cpumask);
+EXPORT_TRACEPOINT_SYMBOL_GPL(sched_process_exit);
 
 /*
  * Export tracepoints that act as a bare tracehook (ie: have no trace event

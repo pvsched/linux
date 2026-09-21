@@ -689,6 +689,11 @@ static enum scx_enable_state scx_enable_state(void)
 	return atomic_read(&scx_enable_state_var);
 }
 
+bool scx_active(void)
+{
+	return scx_enable_state() != SCX_DISABLED;
+}
+
 static enum scx_enable_state scx_set_enable_state(enum scx_enable_state to)
 {
 	return atomic_xchg(&scx_enable_state_var, to);
