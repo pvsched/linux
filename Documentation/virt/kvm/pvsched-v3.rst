@@ -5,8 +5,8 @@ Paravirtualized scheduling (pvsched)
 ====================================
 
 :Author: Vineeth Pillai
-:Status: ABI, inactive control, request/accounting cores, and factual KVM
-         run/inner hooks
+:Status: ABI, inactive control, request/accounting cores, scheduler bridge,
+         and factual KVM run/inner hooks
 
 Overview
 ========
@@ -24,9 +24,10 @@ thread.  The framework, policy implementations, KVM event sources, transport,
 and lifecycle interfaces are deliberately separate from the shared-page ABI.
 
 The ABI version 1 shared-page representation, deterministic budget arithmetic,
-built-in request selection, an inactive runner-identity control plane, and
-factual KVM run and inner-loop hooks are defined at this stage.  There is no
-shared-page attachment, transport binding, or active pvsched runtime yet.
+built-in request selection, an inactive runner-identity control plane, the
+restricted scheduler bridge, and factual KVM run and inner-loop hooks are
+defined at this stage.  There is no shared-page attachment, transport binding,
+or active pvsched runtime yet.
 
 Architecture
 ============
@@ -46,8 +47,8 @@ The planned design has four components:
 
 x86 KVM provides factual architecture-run and inner guest-entry/exit events,
 but does not own policy selection, shared-page negotiation, or boost
-accounting.  The KVM hooks are prerequisites only: no active runtime
-currently binds them to the shared-page ABI.
+accounting.  The scheduler bridge and KVM hooks are prerequisites only: no
+active runtime currently binds them to the shared-page ABI.
 
 Budget accounting core
 ======================
