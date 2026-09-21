@@ -2261,6 +2261,18 @@ config PVSCHED_DEFAULT_POLICY_KUNIT_TEST
 
 	  If unsure, say N.
 
+config PVSCHED_SCHEDULER_KUNIT_TEST
+	tristate "KUnit test for pvsched scheduler interfaces" if !KUNIT_ALL_TESTS
+	depends on KUNIT && !PREEMPT_RT
+	default KUNIT_ALL_TESTS
+	help
+	  Exercise the scheduler state snapshot and restricted non-PI setter
+	  interfaces used by the pvsched host framework.  Also verify that a
+	  modular GPL consumer can observe task exit through sched_process_exit
+	  when tracepoints are enabled.
+
+	  If unsure, say N.
+
 config TEST_LIST_SORT
 	tristate "Linked list sorting test" if !KUNIT_ALL_TESTS
 	depends on KUNIT
