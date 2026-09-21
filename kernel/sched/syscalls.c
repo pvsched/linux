@@ -773,6 +773,63 @@ int sched_setattr_nocheck(struct task_struct *p, const struct sched_attr *attr)
 EXPORT_SYMBOL_GPL(sched_setattr_nocheck);
 
 /**
+ * sched_setattr_nocheck_nopi - change scheduling attributes without PI handling
+ * @p: task whose scheduling attributes should be changed
+ * @attr: requested scheduling attributes
+ *
+ * This restricted helper rejects SCHED_DEADLINE and utilization-clamp updates
+ * because they can enter sleeping paths.  The existing-policy check is only an
+ * observation, not an atomic compare-and-apply: callers must prevent concurrent
+ * transitions to SCHED_DEADLINE, which could still enter cpuset_lock(), and
+ * must exclude priority-inheritance users.
+ *
+ * Return: zero on success, otherwise a negative error code.
+ */
+int sched_setattr_nocheck_nopi(struct task_struct *p,
+			       const struct sched_attr *attr)
+{
+	if (dl_policy(attr->sched_policy) ||
+	    dl_policy(READ_ONCE(p->policy)) ||
+	    (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP))
+		return -EINVAL;
+
+	return __sched_setscheduler(p, attr, false, false);
+}
+EXPORT_SYMBOL_GPL(sched_setattr_nocheck_nopi);
+
+/**
+ * sched_get_task_state - snapshot a task's scheduling configuration
+ * @p: task to inspect; the caller must hold a task reference
+ * @state: destination for the snapshot
+ *
+ * The scheduling fields are sampled while holding the task's rq lock.  Timer
+ * slack and the system-wide sched_ext state are nonblocking observations and
+ * may be changed by an external owner after this function returns.  In
+ * particular, this snapshot and a later scheduling update are not an atomic
+ * compare-and-apply operation.
+ */
+void sched_get_task_state(struct task_struct *p,
+			  struct sched_task_state *state)
+{
+	struct rq_flags rf;
+	struct rq *rq;
+
+	rq = task_rq_lock(p, &rf);
+	*state = (struct sched_task_state) {
+		.policy = p->policy,
+		.nice = task_nice(p),
+		.rt_priority = p->rt_priority,
+		.reset_on_fork = p->sched_reset_on_fork,
+		.custom_slice = p->se.custom_slice,
+		.slice_ns = p->se.custom_slice ? p->se.slice : 0,
+		.timer_slack_ns = READ_ONCE(p->timer_slack_ns),
+		.scx_active = scx_active(),
+	};
+	task_rq_unlock(rq, p, &rf);
+}
+EXPORT_SYMBOL_GPL(sched_get_task_state);
+
+/**
  * sched_setscheduler_nocheck - change the scheduling policy and/or RT priority of a thread from kernel-space.
  * @p: the task in question.
  * @policy: new policy.

@@ -1958,8 +1958,35 @@ extern void sched_set_fifo(struct task_struct *p);
 extern void sched_set_fifo_low(struct task_struct *p);
 extern void sched_set_fifo_secondary(struct task_struct *p);
 extern void sched_set_normal(struct task_struct *p, int nice);
+
+/**
+ * struct sched_task_state - task scheduling state for kernel consumers
+ * @policy: configured scheduling policy
+ * @nice: latent nice value, including for real-time and idle policies
+ * @rt_priority: configured real-time priority
+ * @reset_on_fork: whether reset-on-fork is configured
+ * @custom_slice: whether the fair scheduling slice is explicit
+ * @slice_ns: explicit fair scheduling slice, or zero for the dynamic default
+ * @timer_slack_ns: sampled timer slack
+ * @scx_active: whether sched_ext is enabled or changing enable state
+ */
+struct sched_task_state {
+	unsigned int	policy;
+	int		nice;
+	unsigned int	rt_priority;
+	bool		reset_on_fork;
+	bool		custom_slice;
+	u64		slice_ns;
+	u64		timer_slack_ns;
+	bool		scx_active;
+};
+
 extern int sched_setattr(struct task_struct *, const struct sched_attr *);
 extern int sched_setattr_nocheck(struct task_struct *, const struct sched_attr *);
+int sched_setattr_nocheck_nopi(struct task_struct *p,
+			       const struct sched_attr *attr);
+void sched_get_task_state(struct task_struct *p,
+			  struct sched_task_state *state);
 extern struct task_struct *idle_task(int cpu);
 
 /**
