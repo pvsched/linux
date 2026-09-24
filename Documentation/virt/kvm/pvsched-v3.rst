@@ -204,7 +204,9 @@ The inner hooks report these additional facts:
   blocking states do not emit them.
 * ``kvm_pvsched_vcpu_inject_intr`` reports an accepted fixed/lowest-priority
   LAPIC interrupt or queued NMI.  It is a wake opportunity, not proof that the
-  guest handled the interrupt.
+  guest handled the interrupt.  It also reports whether the injecting context
+  is a vCPU that may still have guest state loaded (any mode except
+  ``OUTSIDE_GUEST_MODE``), so a consumer can avoid scheduler work there.
 
 VMENTRY facts are not paired one-for-one with terminal facts.  A fast loop can
 publish multiple VMENTRY attempts before one terminal pair.  Conversely, a

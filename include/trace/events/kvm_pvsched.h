@@ -53,8 +53,9 @@ DECLARE_TRACE(kvm_pvsched_vcpu_unhalt,
 	      TP_ARGS(vcpu, mode_flags));
 
 DECLARE_TRACE(kvm_pvsched_vcpu_inject_intr,
-	      TP_PROTO(struct kvm_vcpu *vcpu, u32 mode_flags),
-	      TP_ARGS(vcpu, mode_flags));
+	      TP_PROTO(struct kvm_vcpu *vcpu, u32 mode_flags,
+		       bool source_guest_mode),
+	      TP_ARGS(vcpu, mode_flags, source_guest_mode));
 #endif
 
 #endif /* _TRACE_KVM_PVSCHED_H */
