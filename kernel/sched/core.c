@@ -5682,6 +5682,10 @@ static inline void prefetch_curr_exec_start(struct task_struct *p)
  * Return accounted runtime for the task.
  * In case the task is currently running, return the runtime plus current's
  * pending runtime that have not been accounted yet.
+ *
+ * The caller must keep p alive, for example by holding a task reference. This
+ * may acquire p->pi_lock and an rq lock, so it must not be called from NMI
+ * context or with either lock held.
  */
 unsigned long long task_sched_runtime(struct task_struct *p)
 {
@@ -5721,6 +5725,7 @@ unsigned long long task_sched_runtime(struct task_struct *p)
 
 	return ns;
 }
+EXPORT_SYMBOL_GPL(task_sched_runtime);
 
 static u64 cpu_resched_latency(struct rq *rq)
 {
