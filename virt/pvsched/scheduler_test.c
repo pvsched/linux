@@ -2,8 +2,11 @@
 
 #include <kunit/test.h>
 #include <linux/completion.h>
+#include <linux/delay.h>
 #include <linux/kthread.h>
 #include <linux/sched.h>
+#include <linux/sched/clock.h>
+#include <linux/sched/cputime.h>
 #include <linux/sched/task.h>
 #include <linux/tracepoint.h>
 #include <linux/types.h>
@@ -22,6 +25,15 @@ struct pvsched_scheduler_test_ctx {
 #endif
 };
 
+#ifndef CONFIG_UML
+struct pvsched_scheduler_runtime_test_ctx {
+	struct completion done;
+	u64 accounted;
+	u64 runtime;
+	u64 clock_elapsed;
+};
+#endif
+
 static int pvsched_scheduler_test_thread(void *data)
 {
 	struct pvsched_scheduler_test_ctx *ctx = data;
@@ -31,6 +43,28 @@ static int pvsched_scheduler_test_thread(void *data)
 		schedule_timeout_interruptible(HZ);
 	return 0;
 }
+
+#ifndef CONFIG_UML
+static int pvsched_scheduler_runtime_test_thread(void *data)
+{
+	struct pvsched_scheduler_runtime_test_ctx *ctx = data;
+	unsigned long flags;
+	u64 clock;
+
+	local_irq_save(flags);
+	ctx->accounted = READ_ONCE(current->se.sum_exec_runtime);
+	clock = local_clock();
+	udelay(1000);
+	ctx->runtime = task_sched_runtime(current);
+	ctx->clock_elapsed = local_clock() - clock;
+	local_irq_restore(flags);
+	complete(&ctx->done);
+
+	while (!kthread_should_stop())
+		schedule_timeout_interruptible(HZ);
+	return 0;
+}
+#endif
 
 #ifdef CONFIG_TRACEPOINTS
 static void pvsched_scheduler_test_exit(void *data, struct task_struct *task,
@@ -242,8 +276,41 @@ static void pvsched_scheduler_interfaces_test(struct kunit *test)
 #endif
 }
 
+/*
+ * A raw sum_exec_runtime read omits the current task's pending runtime.  Keep
+ * local timer interrupts off while delaying so an incidental scheduler tick
+ * cannot account the interval before task_sched_runtime() does.
+ */
+static void pvsched_scheduler_runtime_pending_test(struct kunit *test)
+{
+#ifdef CONFIG_UML
+	/* UML does not advance the rq clock while local IRQs are disabled. */
+	kunit_skip(test, "requires an IRQ-independent scheduler clock");
+#else
+	struct pvsched_scheduler_runtime_test_ctx ctx;
+	struct task_struct *task;
+	unsigned long done;
+	int ret;
+
+	init_completion(&ctx.done);
+	task = kthread_run(pvsched_scheduler_runtime_test_thread, &ctx,
+			   "pvsched-runtime-test");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, task);
+	done = wait_for_completion_timeout(&ctx.done, HZ);
+	ret = kthread_stop(task);
+	KUNIT_ASSERT_NE(test, done, 0UL);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	if (!ctx.clock_elapsed) {
+		kunit_skip(test, "local scheduler clock did not advance with IRQs off");
+		return;
+	}
+	KUNIT_EXPECT_GT(test, ctx.runtime, ctx.accounted);
+#endif
+}
+
 static struct kunit_case pvsched_scheduler_test_cases[] = {
 	KUNIT_CASE(pvsched_scheduler_interfaces_test),
+	KUNIT_CASE(pvsched_scheduler_runtime_pending_test),
 	{}
 };
 
