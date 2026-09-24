@@ -2339,6 +2339,18 @@ config PVSCHED_ACCOUNTING_KUNIT_TEST
 
 	  If unsure, say N.
 
+config PVSCHED_RUNTIME_ACCOUNTING_KUNIT_TEST
+	tristate "KUnit test for pvsched runtime settlement" if !KUNIT_ALL_TESTS
+	depends on KUNIT && PVSCHED
+	default KUNIT_ALL_TESTS
+	help
+	  Enable tests for pvsched host-runtime and hardware-epoch settlement.
+	  Exercise transition attribution, conservative mixed intervals and
+	  no-double-charge anchoring.  These tests do not enable runtime
+	  scheduling or require KVM.
+
+	  If unsure, say N.
+
 config PVSCHED_DEFAULT_POLICY_KUNIT_TEST
 	tristate "KUnit test for pvsched built-in policy selection" if !KUNIT_ALL_TESTS
 	depends on KUNIT && PVSCHED
