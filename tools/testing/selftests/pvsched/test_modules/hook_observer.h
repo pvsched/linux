@@ -23,6 +23,7 @@ enum pvsched_hook_event {
 };
 
 #define PVSCHED_HOOK_RECORD_F_INTERRUPT_READY	(1U << 0)
+#define PVSCHED_HOOK_RECORD_F_SOURCE_GUEST_MODE	(1U << 1)
 #define PVSCHED_HOOK_RECORD_F_HLT_EXIT		(1U << 2)
 
 /*
