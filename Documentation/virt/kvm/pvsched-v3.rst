@@ -186,13 +186,15 @@ The inner hooks report these additional facts:
   to its terminal IRQ-off fact includes the bounded LAPIC timer-advance
   wait; VMX also includes PT/perf preparation.  The wait is capped at 5
   microseconds.
-* ``kvm_pvsched_vmexit_irqoff`` reports the terminal accounting fact after
-  host PKRU has been restored and before host interrupts are enabled for every
-  vendor return.  A VMEXIT fact does not prove that hardware entry occurred
-  because vendor code can return without entering the guest; synthetic VMX
-  and SVM returns use the same terminal path even if no VMENTRY fact occurred.
+* ``kvm_pvsched_vmexit_irqoff`` reports a future pinned-timer cancellation
+  opportunity after host PKRU has been restored and before host interrupts are
+  enabled for every vendor return.  It does not close or settle an accounting
+  window.  A VMEXIT fact does not prove that hardware entry occurred because
+  vendor code can return without entering the guest; synthetic VMX and SVM
+  returns use the same terminal path even if no VMENTRY fact occurred.
 * ``kvm_pvsched_vmexit`` reports the slow reconciliation checkpoint after
-  host interrupts are enabled and before preemption is enabled.
+  host interrupts are enabled and before preemption is enabled.  A future
+  consumer closes or settles its guest accounting window at this IRQ-on fact.
   The fact also reports whether the exit is a non-nested ``HLT`` exit,
   whether or not KVM has handled it yet, so a consumer can keep a halting
   vCPU boosted until it blocks.
@@ -213,8 +215,9 @@ VMENTRY facts are not paired one-for-one with terminal facts.  A fast loop can
 publish multiple VMENTRY attempts before one terminal pair.  Conversely, a
 common cancellation before vendor entry publishes only the IRQ-on
 VMENTRY_CANCEL fact.  A future pvsched consumer must therefore retain its own
-epoch state; a stop on a closed epoch is a no-op, while a terminal fact closes
-an epoch opened by an earlier fast attempt.
+guest-window state; a repeated VMENTRY keeps the open window, while the IRQ-on
+terminal fact closes a window opened by an earlier fast attempt.  The IRQ-off
+fact only gives that consumer an opportunity to cancel its pinned cap timer.
 
 The mode-sensitive entry, exit, halt and injection hooks report fresh internal
 mode flags.  RUN_LEAVE retains its result and exit-reason fields.  The flags
