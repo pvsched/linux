@@ -1080,9 +1080,21 @@ void kvm_arch_vcpu_block_wake(struct kvm_vcpu *vcpu)
 
 void kvm_pvsched_vcpu_inject_intr(struct kvm_vcpu *vcpu)
 {
-	if (trace_kvm_pvsched_vcpu_inject_intr_tp_enabled())
-		trace_kvm_pvsched_vcpu_inject_intr_tp(vcpu,
-						      kvm_pvsched_get_mode_flags(vcpu));
+	struct kvm_vcpu *src;
+
+	if (!trace_kvm_pvsched_vcpu_inject_intr_tp_enabled())
+		return;
+
+	src = kvm_get_running_vcpu();
+	/*
+	 * A kick can leave guest state loaded in EXITING_GUEST_MODE, so check for
+	 * OUTSIDE rather than IN_GUEST. Conservatively treating
+	 * READING_SHADOW_PAGE_TABLES as guest mode is harmless.
+	 */
+	trace_kvm_pvsched_vcpu_inject_intr_tp(vcpu,
+					      kvm_pvsched_get_mode_flags(vcpu),
+					      src && READ_ONCE(src->mode) !=
+						     OUTSIDE_GUEST_MODE);
 }
 #endif
 

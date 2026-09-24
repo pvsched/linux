@@ -150,7 +150,7 @@ static void obs_unhalt(void *data, struct kvm_vcpu *vcpu, u32 mode_flags)
 }
 
 static void obs_inject_intr(void *data, struct kvm_vcpu *vcpu,
-			   u32 mode_flags)
+			   u32 mode_flags, bool source_guest_mode)
 {
 	obs_record(PVSCHED_HOOK_INJECT_INTR, vcpu, 0, 0, mode_flags, 0);
 }
