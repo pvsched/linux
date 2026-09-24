@@ -759,14 +759,14 @@ int main(void)
 		if (ret < 0) {
 			result(0, "query user NMI capability");
 		} else if (!ret) {
-			skip("queued NMI emits one interrupt fact",
+			skip("userspace NMI reports no guest-mode source",
 			     "user NMI unavailable");
 		} else {
 			ret = ioctl(observer, PVSCHED_HOOK_IOC_RESET, 0);
 			if (!ret)
 				ret = ioctl(vm.vcpu, KVM_NMI, 0);
 			result(!ret && !snapshot(observer, &s) && queued_nmi_fact(&s),
-			       "queued NMI emits one interrupt fact");
+			       "userspace NMI reports no guest-mode source");
 		}
 		close(observer);
 	}
