@@ -871,6 +871,26 @@ void sched_get_task_state(struct task_struct *p,
 EXPORT_SYMBOL_GPL(sched_get_task_state);
 
 /**
+ * sched_set_task_timer_slack - restore a task's current timer slack
+ * @p: task to update; the caller must hold a task reference
+ * @timer_slack_ns: current slack to install without changing the default
+ *
+ * This is a non-sleeping companion to scheduler policy restoration.  The rq
+ * lock orders the update with scheduler policy changes that reset current
+ * timer slack; callers must separately exclude other timer-slack owners.
+ */
+void sched_set_task_timer_slack(struct task_struct *p, u64 timer_slack_ns)
+{
+	struct rq_flags rf;
+	struct rq *rq;
+
+	rq = task_rq_lock(p, &rf);
+	WRITE_ONCE(p->timer_slack_ns, timer_slack_ns);
+	task_rq_unlock(rq, p, &rf);
+}
+EXPORT_SYMBOL_GPL(sched_set_task_timer_slack);
+
+/**
  * sched_setscheduler_nocheck - change the scheduling policy and/or RT priority of a thread from kernel-space.
  * @p: the task in question.
  * @policy: new policy.

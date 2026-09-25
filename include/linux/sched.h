@@ -1947,6 +1947,7 @@ int sched_setattr_nocheck_nopi(struct task_struct *p,
 			       const struct sched_attr *attr);
 void sched_get_task_state(struct task_struct *p,
 			  struct sched_task_state *state);
+void sched_set_task_timer_slack(struct task_struct *p, u64 timer_slack_ns);
 extern struct task_struct *idle_task(int cpu);
 
 /**
