@@ -540,6 +540,69 @@ static void pvsched_default_policy_ops_map_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, pvsched_default_ops_map(ops_ctx, &in), 0);
 	pvsched_expect_params(test, ops_ctx, SCHED_NORMAL, 5, 0,
 			      PVSCHED_CLASS_BASELINE);
+
+	/* Host reasons and a live ticket select CS unless throttled. */
+	in.reasons = 1;
+	KUNIT_ASSERT_EQ(test, pvsched_default_ops_map(ops_ctx, &in), 0);
+	pvsched_expect_params(test, ops_ctx, SCHED_FIFO, 0, config.cs_rt_prio,
+			      PVSCHED_CLASS_CS);
+	in.cs_throttled = true;
+	KUNIT_ASSERT_EQ(test, pvsched_default_ops_map(ops_ctx, &in), 0);
+	pvsched_expect_params(test, ops_ctx, SCHED_NORMAL, 5, 0,
+			      PVSCHED_CLASS_BASELINE);
+	in.cs_throttled = false;
+	in.reasons = 0;
+	in.ticket_live = true;
+	KUNIT_ASSERT_EQ(test, pvsched_default_ops_map(ops_ctx, &in), 0);
+	pvsched_expect_params(test, ops_ctx, SCHED_FIFO, 0, config.cs_rt_prio,
+			      PVSCHED_CLASS_CS);
+	in.generic_throttled = true;
+	KUNIT_ASSERT_EQ(test, pvsched_default_ops_map(ops_ctx, &in), 0);
+	pvsched_expect_params(test, ops_ctx, SCHED_NORMAL, 5, 0,
+			      PVSCHED_CLASS_BASELINE);
+}
+
+static void pvsched_default_policy_ops_hold_test(struct kunit *test)
+{
+	struct pvsched_default_policy_config config =
+		pvsched_default_policy_get_config();
+	struct pvsched_default_guest_area guest = pvsched_test_guest();
+	struct pvsched_map_input in = {
+		.event = PVSCHED_RECONCILE_VMEXIT,
+		.guest = &guest,
+		.hold_offered = true,
+	};
+	struct pvsched_default_ops_ctx *ops_ctx;
+
+	ops_ctx = kunit_kzalloc(test, sizeof(*ops_ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ops_ctx);
+	pvsched_default_ops_init(ops_ctx, 0);
+
+	/* Nothing elevated is applied, so there is nothing to hold. */
+	KUNIT_ASSERT_EQ(test, pvsched_default_ops_map(ops_ctx, &in), 0);
+	pvsched_expect_params(test, ops_ctx, SCHED_NORMAL, 0, 0,
+			      PVSCHED_CLASS_BASELINE);
+
+	/* An applied FIFO boost is held rather than lowered... */
+	ops_ctx->applied.prio = (struct pvsched_prio_desc) {
+		SCHED_FIFO, 0, config.cs_rt_prio };
+	KUNIT_ASSERT_EQ(test, pvsched_default_ops_map(ops_ctx, &in), 0);
+	KUNIT_EXPECT_MEMEQ(test, &ops_ctx->out, &ops_ctx->applied,
+			   sizeof(ops_ctx->out));
+	KUNIT_EXPECT_EQ(test, ops_ctx->flags, PVSCHED_MAP_HELD);
+
+	/* ...only when the hold is offered... */
+	in.hold_offered = false;
+	KUNIT_ASSERT_EQ(test, pvsched_default_ops_map(ops_ctx, &in), 0);
+	pvsched_expect_params(test, ops_ctx, SCHED_NORMAL, 0, 0,
+			      PVSCHED_CLASS_BASELINE);
+
+	/* ...and not when the target is at least as urgent. */
+	in.hold_offered = true;
+	guest.cs_state = cpu_to_le64(PVSCHED_CS_HARDIRQ);
+	KUNIT_ASSERT_EQ(test, pvsched_default_ops_map(ops_ctx, &in), 0);
+	pvsched_expect_params(test, ops_ctx, SCHED_FIFO, 0, config.cs_rt_prio,
+			      PVSCHED_CLASS_CS);
 }
 
 static void pvsched_default_policy_ops_capture_test(struct kunit *test)
@@ -578,6 +641,7 @@ static struct kunit_case pvsched_default_policy_test_cases[] = {
 	KUNIT_CASE(pvsched_default_policy_cs_throttle_test),
 	KUNIT_CASE(pvsched_default_policy_generic_throttle_test),
 	KUNIT_CASE(pvsched_default_policy_ops_map_test),
+	KUNIT_CASE(pvsched_default_policy_ops_hold_test),
 	KUNIT_CASE(pvsched_default_policy_ops_capture_test),
 	{}
 };
