@@ -7,11 +7,34 @@
 #include "default_policy.h"
 #include "policy.h"
 
+static int pvsched_policy_test_capture(struct pvsched_policy_ctx *ctx,
+				       void *baseline)
+{
+	return 0;
+}
+
+static int pvsched_policy_test_map(struct pvsched_policy_ctx *ctx,
+				   const struct pvsched_map_input *in, void *out,
+				   enum pvsched_boost_class *class, u32 *out_flags)
+{
+	return 0;
+}
+
+static int pvsched_policy_test_apply(struct pvsched_policy_ctx *ctx,
+				     const void *params)
+{
+	return 0;
+}
+
 static const struct pvsched_policy_ops pvsched_policy_test_template = {
 	.name = "kunit-policy",
 	.version = 3,
 	.protocol = PVSCHED_PROTOCOL_DEFAULT,
 	.params_size = 40,
+	.priv_size = 8,
+	.capture_baseline = pvsched_policy_test_capture,
+	.map = pvsched_policy_test_map,
+	.apply = pvsched_policy_test_apply,
 };
 
 static void pvsched_policy_test_unregister(void *ops)
@@ -70,13 +93,26 @@ static void pvsched_policy_register_refusals_test(struct kunit *test)
 	ops.params_size = PVSCHED_POLICY_PARAMS_MAX + 1;
 	KUNIT_EXPECT_EQ(test, pvsched_register_policy(&ops), -EINVAL);
 	ops = pvsched_policy_test_template;
+	ops.priv_size = PVSCHED_POLICY_PRIV_MAX + 1;
+	KUNIT_EXPECT_EQ(test, pvsched_register_policy(&ops), -EINVAL);
+	ops = pvsched_policy_test_template;
 	ops.protocol = PVSCHED_PROTOCOL_CUSTOM;
+	KUNIT_EXPECT_EQ(test, pvsched_register_policy(&ops), -EINVAL);
+	ops = pvsched_policy_test_template;
+	ops.capture_baseline = NULL;
+	KUNIT_EXPECT_EQ(test, pvsched_register_policy(&ops), -EINVAL);
+	ops = pvsched_policy_test_template;
+	ops.map = NULL;
+	KUNIT_EXPECT_EQ(test, pvsched_register_policy(&ops), -EINVAL);
+	ops = pvsched_policy_test_template;
+	ops.apply = NULL;
 	KUNIT_EXPECT_EQ(test, pvsched_register_policy(&ops), -EINVAL);
 	KUNIT_EXPECT_NULL(test, pvsched_policy_lookup("kunit-policy", 3));
 
-	/* The largest size is accepted. */
+	/* The largest sizes are accepted. */
 	ops = pvsched_policy_test_template;
 	ops.params_size = PVSCHED_POLICY_PARAMS_MAX;
+	ops.priv_size = PVSCHED_POLICY_PRIV_MAX;
 	KUNIT_ASSERT_EQ(test, pvsched_register_policy(&ops), 0);
 	pvsched_unregister_policy(&ops);
 }

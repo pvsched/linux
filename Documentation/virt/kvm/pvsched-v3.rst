@@ -74,13 +74,14 @@ linked into an active pvsched runtime at this stage.
 Built-in request selection
 ==========================
 
-The selector expects a snapshot of the complete default guest area that its
-caller validated; it validates configuration and baseline even when
-throttled.  It maps NORMAL and BATCH to host NORMAL with the guest nice
-value, IDLE to host IDLE, FIFO and RR to capped host FIFO, and guest DEADLINE
-to host FIFO at a separately configured priority.  It never requests host
-DEADLINE.  Current and valid pending task descriptions are compared after
-mapping, with the current description retained on a tie.
+The framework validates a stable private snapshot of the complete default
+guest area before any policy sees it, and an invalid snapshot selects the
+baseline.  The built-in default policy then selects a request.  It maps
+NORMAL and BATCH to host NORMAL with the guest nice value, IDLE to host IDLE,
+FIFO and RR to capped host FIFO, and guest DEADLINE to host FIFO at a
+separately configured priority.  It never requests host DEADLINE.  Current
+and valid pending task descriptions are compared after mapping, with the
+current description retained on a tie.
 
 Generic throttling suppresses CS elevation and clamps each above-baseline task
 candidate to the saved NORMAL baseline.  The usual task rule is then applied:
@@ -90,13 +91,14 @@ but a stale, less-urgent pending hint cannot deboost below current's clamped
 intent.  Without generic throttling, an active, eligible critical section
 selects the configured CS FIFO request; a throttled CS request reveals the
 independently selected task request.  There is no unconditional baseline
-priority floor.  Invalid input produces no selection.
+priority floor.  The framework validates the guest area, and the selector
+validates configuration and baseline, even when throttled.  Invalid input
+produces no selection.
 
 The selector neither accesses shared memory nor applies scheduling, updates
 accounting, or retains a previous decision.  Its explicit priority controls
-have no runtime configuration interface yet.  Later integration must define
-how invalid runtime snapshots are handled and must account actual successfully
-applied execution rather than a selected request.
+have no runtime configuration interface yet.  Later integration must account
+actual successfully applied execution rather than a selected request.
 
 Inactive runner control
 =======================

@@ -45,6 +45,11 @@ int pvsched_policy_pin(const char *name, u32 version,
 		       struct pvsched_policy_entry **pinned);
 void pvsched_policy_unpin(struct pvsched_policy_entry *entry);
 
+/* The built-in default, whose failures are kernel bugs worth a WARN. */
+bool pvsched_policy_builtin(const struct pvsched_policy_ops *ops);
+/* The registry entry of the built-in default, alive while pvsched is. */
+struct pvsched_policy_entry *pvsched_policy_default_entry(void);
+
 /*
  * Whether a private snapshot of the default guest area is well formed:
  * valid task tuples, a zero pending tuple unless flagged, and no reserved
