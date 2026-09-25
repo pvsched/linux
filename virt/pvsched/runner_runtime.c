@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <linux/errno.h>
+#include <linux/export.h>
 #include <linux/ktime.h>
 #include <linux/err.h>
 #include <linux/sched/cputime.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <kunit/visibility.h>
 
 #include "runner_runtime.h"
 
@@ -287,6 +289,7 @@ err_put:
 	}
 	return ret;
 }
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_init);
 
 void pvsched_runner_runtime_destroy(struct pvsched_runner_runtime *runtime)
 {
@@ -327,6 +330,7 @@ void pvsched_runner_runtime_destroy(struct pvsched_runner_runtime *runtime)
 		runtime->entry = NULL;
 	}
 }
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_destroy);
 
 int pvsched_runner_reconcile(struct pvsched_runner_runtime *runtime,
 			     enum pvsched_reconcile_event event,
@@ -478,6 +482,7 @@ out:
 	raw_spin_unlock_irqrestore(&runtime->state_lock, flags);
 	return ret;
 }
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_reconcile);
 
 int pvsched_runner_guest_start(struct pvsched_runner_runtime *runtime)
 {
@@ -516,6 +521,7 @@ int pvsched_runner_guest_start(struct pvsched_runner_runtime *runtime)
 	raw_spin_unlock_irqrestore(&runtime->state_lock, flags);
 	return ret;
 }
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_guest_start);
 
 void pvsched_runner_guest_exit_irqoff(struct pvsched_runner_runtime *runtime)
 {
@@ -525,6 +531,7 @@ void pvsched_runner_guest_exit_irqoff(struct pvsched_runner_runtime *runtime)
 	 */
 	hrtimer_try_to_cancel(&runtime->cutoff_timer);
 }
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_guest_exit_irqoff);
 
 void pvsched_runner_publish_vmentry(struct pvsched_runner_runtime *runtime,
 				    struct pvsched_host_area *host)
