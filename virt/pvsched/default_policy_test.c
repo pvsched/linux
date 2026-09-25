@@ -4,6 +4,7 @@
 #include <linux/errno.h>
 #include <linux/sched.h>
 #include <linux/string.h>
+#include <uapi/linux/sched/types.h>
 
 #include "default_policy.h"
 #include "policy.h"
@@ -450,6 +451,122 @@ static void pvsched_default_policy_generic_throttle_test(struct kunit *test)
 	}
 }
 
+/* A default-policy binding built on local buffers, as a runtime lays it out. */
+struct pvsched_default_ops_ctx {
+	struct pvsched_policy_ctx ctx;
+	struct pvsched_default_priv priv;
+	struct pvsched_default_params baseline;
+	struct pvsched_default_params applied;
+	struct pvsched_default_params out;
+	enum pvsched_boost_class class;
+	u32 flags;
+};
+
+static void pvsched_default_ops_init(struct pvsched_default_ops_ctx *ops_ctx,
+				     int baseline_nice)
+{
+	memset(ops_ctx, 0, sizeof(*ops_ctx));
+	ops_ctx->baseline.prio.sched_policy = SCHED_NORMAL;
+	ops_ctx->baseline.prio.nice = baseline_nice;
+	ops_ctx->baseline.custom_slice = 1;
+	ops_ctx->baseline.slice_ns = 3000000;
+	ops_ctx->baseline.timer_slack_ns = 50000;
+	ops_ctx->priv.expected_nice = baseline_nice;
+	ops_ctx->applied = ops_ctx->baseline;
+	ops_ctx->ctx = (struct pvsched_policy_ctx) {
+		.task = current,
+		.priv = &ops_ctx->priv,
+		.baseline = &ops_ctx->baseline,
+		.applied = &ops_ctx->applied,
+	};
+}
+
+static int pvsched_default_ops_map(struct pvsched_default_ops_ctx *ops_ctx,
+				   const struct pvsched_map_input *in)
+{
+	memset(&ops_ctx->out, 0, sizeof(ops_ctx->out));
+	ops_ctx->class = PVSCHED_CLASS_BASELINE;
+	ops_ctx->flags = 0;
+	return pvsched_default_policy_ops.map(&ops_ctx->ctx, in, &ops_ctx->out,
+					      &ops_ctx->class, &ops_ctx->flags);
+}
+
+static void pvsched_expect_params(struct kunit *test,
+				  const struct pvsched_default_ops_ctx *ops_ctx,
+				  u8 policy, s8 nice, u8 rt_prio,
+				  enum pvsched_boost_class class)
+{
+	struct pvsched_default_params expected = ops_ctx->baseline;
+
+	expected.prio = (struct pvsched_prio_desc) { policy, nice, rt_prio };
+	/* The output carries the baseline's slice and slack, byte for byte. */
+	KUNIT_EXPECT_MEMEQ(test, &ops_ctx->out, &expected, sizeof(expected));
+	KUNIT_EXPECT_EQ(test, ops_ctx->class, class);
+	KUNIT_EXPECT_EQ(test, ops_ctx->flags, 0U);
+}
+
+static void pvsched_default_policy_ops_map_test(struct kunit *test)
+{
+	struct pvsched_default_policy_config config =
+		pvsched_default_policy_get_config();
+	struct pvsched_default_guest_area guest = pvsched_test_guest();
+	struct pvsched_map_input in = {
+		.event = PVSCHED_RECONCILE_CANCEL,
+		.guest = &guest,
+	};
+	struct pvsched_default_ops_ctx *ops_ctx;
+
+	ops_ctx = kunit_kzalloc(test, sizeof(*ops_ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ops_ctx);
+	pvsched_default_ops_init(ops_ctx, 0);
+
+	/* The class follows from the tuple, as budget charging did. */
+	guest.cs_state = cpu_to_le64(PVSCHED_CS_NMI);
+	KUNIT_ASSERT_EQ(test, pvsched_default_ops_map(ops_ctx, &in), 0);
+	pvsched_expect_params(test, ops_ctx, SCHED_FIFO, 0, config.cs_rt_prio,
+			      PVSCHED_CLASS_CS);
+	guest.cs_state = 0;
+	guest.task_intent.current_task.nice = -5;
+	KUNIT_ASSERT_EQ(test, pvsched_default_ops_map(ops_ctx, &in), 0);
+	pvsched_expect_params(test, ops_ctx, SCHED_NORMAL, -5, 0,
+			      PVSCHED_CLASS_TASK);
+	guest.task_intent.current_task = (struct pvsched_prio_desc) {
+		SCHED_FIFO, 0, 10 };
+	KUNIT_ASSERT_EQ(test, pvsched_default_ops_map(ops_ctx, &in), 0);
+	pvsched_expect_params(test, ops_ctx, SCHED_FIFO, 0, 10,
+			      PVSCHED_CLASS_TASK);
+	guest.task_intent.current_task = (struct pvsched_prio_desc) {
+		SCHED_NORMAL, 5, 0 };
+	KUNIT_ASSERT_EQ(test, pvsched_default_ops_map(ops_ctx, &in), 0);
+	pvsched_expect_params(test, ops_ctx, SCHED_NORMAL, 5, 0,
+			      PVSCHED_CLASS_BASELINE);
+}
+
+static void pvsched_default_policy_ops_capture_test(struct kunit *test)
+{
+	struct pvsched_default_params first, second;
+	struct pvsched_default_priv priv = { .expected_nice = 99 };
+	struct pvsched_policy_ctx ctx = { .task = current, .priv = &priv };
+	struct sched_task_state state;
+
+	sched_get_task_state(current, &state);
+	if (state.policy != SCHED_NORMAL || state.reset_on_fork ||
+	    state.scx_active)
+		kunit_skip(test, "requires a SCHED_NORMAL test thread");
+	memset(&first, 0, sizeof(first));
+	memset(&second, 0, sizeof(second));
+	KUNIT_ASSERT_EQ(test, pvsched_default_policy_ops.capture_baseline(&ctx,
+			&first), 0);
+	KUNIT_ASSERT_EQ(test, pvsched_default_policy_ops.capture_baseline(&ctx,
+			&second), 0);
+	/* Two captures of the same state compare equal byte for byte. */
+	KUNIT_EXPECT_MEMEQ(test, &first, &second, sizeof(first));
+	KUNIT_EXPECT_EQ(test, first.prio.sched_policy, (u8)SCHED_NORMAL);
+	KUNIT_EXPECT_EQ(test, first.prio.nice, (s8)state.nice);
+	KUNIT_EXPECT_EQ(test, first.timer_slack_ns, state.timer_slack_ns);
+	KUNIT_EXPECT_EQ(test, priv.expected_nice, state.nice);
+}
+
 static struct kunit_case pvsched_default_policy_test_cases[] = {
 	KUNIT_CASE(pvsched_default_policy_mapping_test),
 	KUNIT_CASE(pvsched_default_policy_invalid_tuple_test),
@@ -460,6 +577,8 @@ static struct kunit_case pvsched_default_policy_test_cases[] = {
 	KUNIT_CASE(pvsched_default_policy_mapping_before_comparison_test),
 	KUNIT_CASE(pvsched_default_policy_cs_throttle_test),
 	KUNIT_CASE(pvsched_default_policy_generic_throttle_test),
+	KUNIT_CASE(pvsched_default_policy_ops_map_test),
+	KUNIT_CASE(pvsched_default_policy_ops_capture_test),
 	{}
 };
 
