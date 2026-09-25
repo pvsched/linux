@@ -13,6 +13,7 @@
 #ifndef _LINUX_PVSCHED_POLICY_H
 #define _LINUX_PVSCHED_POLICY_H
 
+#include <linux/bits.h>
 #include <linux/build_bug.h>
 #include <linux/types.h>
 #include <uapi/linux/pvsched.h>
@@ -32,6 +33,12 @@ enum pvsched_reconcile_event {
 	PVSCHED_RECONCILE_CANCEL,
 	/* RUN_LEAVE: IRQs enabled, preemptible, setter permitted. */
 	PVSCHED_RECONCILE_RUN_LEAVE,
+	/* HALT: immediately before blocking, setter permitted. */
+	PVSCHED_RECONCILE_HALT,
+	/* UNHALT: after schedule(), balances sleep without classifying it. */
+	PVSCHED_RECONCILE_UNHALT,
+	/* INJECT: accepted producer fact in an audited source context. */
+	PVSCHED_RECONCILE_INJECT,
 };
 
 /*
@@ -44,7 +51,10 @@ enum pvsched_boost_class {
 	PVSCHED_CLASS_BASELINE,
 	/* Elevated for guest task intent: drains the generic budget. */
 	PVSCHED_CLASS_TASK,
-	/* Elevated for a guest critical section: drains both budgets. */
+	/*
+	 * Elevated for a guest critical section or a host reason (halt,
+	 * injection, interrupt ticket, idle hold): drains both budgets.
+	 */
 	PVSCHED_CLASS_CS,
 };
 
@@ -66,13 +76,22 @@ struct pvsched_policy_ctx {
 };
 
 struct pvsched_map_input {
-	/* RUN_ENTER, VMEXIT or CANCEL. */
+	/* RUN_ENTER, VMEXIT, CANCEL, HALT or INJECT. */
 	enum pvsched_reconcile_event event;
 	/* Validated private snapshot of the default guest area. */
 	const struct pvsched_default_guest_area *guest;
+	/* Pending host reasons: halt and accepted injection. */
+	unsigned long reasons;
+	/* An interrupt ticket is outstanding. */
+	bool ticket_live;
 	bool cs_throttled;
 	bool generic_throttled;
+	/* The idle guest may keep the applied value for now (idle hold). */
+	bool hold_offered;
 };
+
+/* map() kept the applied value as an idle hold; its output equals it. */
+#define PVSCHED_MAP_HELD	BIT(0)
 
 /**
  * struct pvsched_policy_ops - a host policy
@@ -91,16 +110,19 @@ struct pvsched_map_input {
  * the baseline buffer before it; a nonzero return refuses the attach.
  *
  * @map, @apply and @owned run with the runner's raw state lock held and
- * IRQs off, at run entry, the IRQ-on VM exit, a cancelled entry and the
- * close and restore paths; never at the late VM entry.  They must not
+ * IRQs off, at run entry, the IRQ-on VM exit, a cancelled entry, halt, an
+ * interrupt injection and the close and restore paths; never at the late
+ * VM entry.  They must not
  * sleep, and @apply must not take a lock that orders before the task's
  * pi_lock or its runqueue lock.
  *
  * pvsched zeroes @map's output first, so equal values compare equal byte
  * for byte, and calls @apply only when the bytes differ from the applied
- * value.  @map must leave *out_flags zero.  pvsched trusts the class: an
- * elevated value labelled BASELINE escapes the budgets.  An error from @map
- * or @apply, or a class the budgets forbid, restores the baseline.
+ * value.  @map may decline host reasons.  It may set PVSCHED_MAP_HELD only
+ * when the input offers the hold, with the applied value as its output; the
+ * applied class is then kept and charged as CS.  pvsched trusts the class:
+ * an elevated value labelled BASELINE escapes the budgets.  An error from
+ * @map or @apply, or a class the budgets forbid, restores the baseline.
  *
  * Without @owned, pvsched cannot see an external owner such as an
  * administrator's chrt(1); the next @apply overrides it.
