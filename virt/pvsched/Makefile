@@ -16,3 +16,6 @@ pvsched-scheduler-test-y := scheduler_test.o
 
 obj-$(CONFIG_PVSCHED_RUNNER_RUNTIME_KUNIT_TEST) += pvsched-runner-runtime-test.o
 pvsched-runner-runtime-test-y := runner_runtime_test.o
+
+obj-$(CONFIG_PVSCHED_ATTACHMENT_KUNIT_TEST) += pvsched-attachment-test.o
+pvsched-attachment-test-y := attachment_test.o
