@@ -109,7 +109,7 @@ struct pvsched_map_input {
  * @capture_baseline runs in process context and may sleep.  pvsched zeroes
  * the baseline buffer before it; a nonzero return refuses the attach.
  *
- * @map, @apply and @owned run with the runner's raw state lock held and
+ * @map, @apply and @owned run with the attachment's raw state lock held and
  * IRQs off, at run entry, the IRQ-on VM exit, a cancelled entry, halt, an
  * interrupt injection and the close and restore paths; never at the late
  * VM entry.  They must not
