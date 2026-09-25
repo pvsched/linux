@@ -2384,8 +2384,9 @@ config PVSCHED_RUNNER_RUNTIME_KUNIT_TEST
 	  the scheduler setter: latent nice ownership, baseline restore, custom
 	  slice/timer-slack preservation, malformed/nested input and external
 	  ownership revocation.  A test host policy wraps the default one to
-	  cover the policy interface: opaque parameters, class charging and
-	  request faults.  These tests require no KVM or shared test VM.
+	  cover the policy interface: opaque parameters, class charging,
+	  request faults and the idle hold.  These tests require no KVM or
+	  shared test VM.
 
 	  If unsure, say N.
 
