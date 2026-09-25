@@ -13,3 +13,6 @@ pvsched-default-policy-test-y := default_policy_test.o
 
 obj-$(CONFIG_PVSCHED_SCHEDULER_KUNIT_TEST) += pvsched-scheduler-test.o
 pvsched-scheduler-test-y := scheduler_test.o
+
+obj-$(CONFIG_PVSCHED_RUNNER_RUNTIME_KUNIT_TEST) += pvsched-runner-runtime-test.o
+pvsched-runner-runtime-test-y := runner_runtime_test.o
