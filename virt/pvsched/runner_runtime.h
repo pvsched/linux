@@ -10,15 +10,7 @@
 
 #include "default_policy.h"
 #include "runtime_accounting.h"
-
-/* Architecture adapters translate their factual mode bits to this mask. */
-enum pvsched_runner_mode_flag {
-	PVSCHED_RUNNER_MODE_NESTED	= BIT(0),
-	PVSCHED_RUNNER_MODE_UNSUPPORTED	= BIT(1),
-	PVSCHED_RUNNER_MODE_NO_TICKET	= BIT(2),
-	/* A VMEXIT fact only: the exit is a non-nested HLT. */
-	PVSCHED_RUNNER_MODE_HLT_EXIT	= BIT(3),
-};
+#include "attachment.h"
 
 enum pvsched_reconcile_event {
 	/* RUN_ENTER: IRQs enabled, preemptible, setter permitted. */
@@ -35,13 +27,6 @@ enum pvsched_reconcile_event {
 	PVSCHED_RECONCILE_UNHALT,
 	/* INJECT: accepted producer fact in an audited source context. */
 	PVSCHED_RECONCILE_INJECT,
-};
-
-enum pvsched_runner_position {
-	PVSCHED_RUNNER_HOST,
-	PVSCHED_RUNNER_BLOCKED,
-	PVSCHED_RUNNER_GUEST,
-	PVSCHED_RUNNER_QEMU,
 };
 
 enum pvsched_runner_reason {
@@ -66,10 +51,8 @@ struct pvsched_ticket_owner {
 };
 
 struct pvsched_runner_runtime {
-	/* Serializes mutable runtime state and setter calls: state -> pi -> rq. */
-	raw_spinlock_t state_lock;
-	/* vCPU thread, referenced from successful init until destroy. */
-	struct task_struct *task;
+	/* Common attachment identity, admission, position and state lock. */
+	struct pvsched_attachment attachment;
 	/* ATTACH scheduling state: restore target and ownership reference. */
 	struct sched_task_state baseline;
 	/* Last successfully applied canonical tuple, published at VMENTRY. */
@@ -86,27 +69,19 @@ struct pvsched_runner_runtime {
 	struct pvsched_ticket_owner *ticket_owner;
 	/* Pinned hard cap timer; its callback only forces a nonfast exit. */
 	struct hrtimer cutoff_timer;
-	/* Attachment generation reserved for validating late callbacks. */
-	u64 generation;
 	/* Latest owned-fault errno; external ownership does not set it. */
 	int last_fault;
 	/*
-	 * Nonzero while a late-entry failure owes one setter-safe baseline
-	 * restore: the errno reported when it is paid.
+	 * Nonzero while a binding or late-entry failure owes one setter-safe
+	 * baseline restore: the errno reported when it is paid.
 	 */
 	int restore_owed_error;
-	/* Runtime service currently admits ordinary operations. */
-	bool active;
 	/* Destruction has closed admission and is draining callbacks. */
 	bool closing;
-	/* sched_process_exit observed; task restoration is no longer safe. */
-	bool exited;
 	/* An owned restore failed; ordinary checkpoints must not retry it. */
 	bool restore_failed;
 	/* KVM currently reports nested L2 execution. */
 	bool nested_l2;
-	/* Target position, updated only by the target's own hooks. */
-	enum pvsched_runner_position position;
 	/* last_guest_area contains a snapshot supplied while not nested. */
 	bool last_guest_area_valid;
 	/* Pending HLT and accepted-injection assistance. */
@@ -127,8 +102,10 @@ struct pvsched_runner_runtime {
 	/* The applied tuple is held for an idle guest; only then cap cutoff. */
 	bool idle_holding;
 #if IS_ENABLED(CONFIG_KUNIT)
-	/* Test-only count of scheduler setter invocations. */
-	u32 setter_calls;
+	/* Avoid task-local static-stub lookup while state_lock is held. */
+	int (*test_setattr)(struct task_struct *task,
+			    const struct sched_attr *attr, void *data);
+	void *test_setattr_data;
 #endif
 };
 
@@ -160,9 +137,11 @@ struct pvsched_runner_runtime {
  * @ticket_owner: persistent runner ticket-generation state
  * @deboost_notify: publish the cooperative guest deboost hint
  *
- * Called by ATTACH_SHM in sleepable task context before publishing the
- * attachment.  It does not call the scheduler setter.  Returns 0, an
- * accounting error, or -EOPNOTSUPP for an unsupported baseline.
+ * Private pre-ATTACH helper used while no public transaction or SHM mapping
+ * exists.  It publishes the private attachment as its final step and does not
+ * call the scheduler setter.  Public ATTACH wiring must instead arrange its
+ * fallible setup and copyout before the final publish callback.  Returns 0,
+ * an accounting error, or -EOPNOTSUPP for an unsupported baseline.
  * A successful call must be paired with pvsched_runner_runtime_destroy().
  */
 int pvsched_runner_runtime_init(struct pvsched_runner_runtime *runtime,
@@ -186,6 +165,12 @@ int pvsched_runner_runtime_init(struct pvsched_runner_runtime *runtime,
  * synchronously cancels the timer and drops the task reference.
  */
 void pvsched_runner_runtime_destroy(struct pvsched_runner_runtime *runtime);
+/* Split close primitives permit one RCU drain for a batch of runtimes. */
+void pvsched_runner_runtime_gate(struct pvsched_runner_runtime *runtime);
+void pvsched_runner_runtime_finish_close(struct pvsched_runner_runtime *runtime);
+void pvsched_runner_runtime_release(struct pvsched_runner_runtime *runtime);
+/* Roll back a failed ATTACH through the same split close lifetime rules. */
+void pvsched_runner_runtime_abort(struct pvsched_runner_runtime *runtime);
 
 /**
  * pvsched_runner_reconcile() - reconcile one factual event
@@ -207,6 +192,14 @@ int pvsched_runner_reconcile(struct pvsched_runner_runtime *runtime,
 			     enum pvsched_reconcile_event event,
 			     const struct pvsched_runner_event_input *input);
 
+/* Target-local adapters that find the runtime by its vCPU key. */
+int pvsched_runner_local_reconcile(const void *vcpu_key,
+				   enum pvsched_reconcile_event event,
+				   const struct pvsched_runner_event_input *input);
+int pvsched_runner_cleanup_reconcile(struct task_struct *task,
+				     enum pvsched_reconcile_event event,
+				     const struct pvsched_runner_event_input *input);
+
 /**
  * pvsched_runner_vmentry() - account, hand off a ticket, and publish feedback
  * @runtime: initialized per-attachment state
@@ -222,6 +215,12 @@ int pvsched_runner_reconcile(struct pvsched_runner_runtime *runtime,
 int pvsched_runner_vmentry(struct pvsched_runner_runtime *runtime,
 			   const struct pvsched_runner_vmentry_input *input,
 			   struct pvsched_host_area *host);
+int pvsched_runner_local_vmentry(const void *vcpu_key,
+				 const struct pvsched_runner_vmentry_input *input,
+				 struct pvsched_host_area *host);
+int pvsched_runner_cleanup_vmentry(struct task_struct *task,
+				   const struct pvsched_runner_vmentry_input *input,
+				   struct pvsched_host_area *host);
 
 /**
  * pvsched_runner_guest_exit_irqoff() - cancel the current GUEST cutoff timer

@@ -5,8 +5,9 @@
 #include <linux/ktime.h>
 #include <linux/sched/cputime.h>
 #include <linux/string.h>
-#include <kunit/visibility.h>
 #include <uapi/linux/sched/types.h>
+#include <kunit/static_stub.h>
+#include <kunit/visibility.h>
 #include "runner_runtime.h"
 
 static enum hrtimer_restart pvsched_cutoff_timer(struct hrtimer *timer)
@@ -93,7 +94,7 @@ static bool pvsched_owned_state(const struct pvsched_runner_runtime *runtime)
 {
 	struct sched_task_state state;
 
-	sched_get_task_state(runtime->task, &state);
+	sched_get_task_state(runtime->attachment.task, &state);
 	/*
 	 * FIFO and IDLE leave fair nice latent, so compare the value last applied
 	 * under NORMAL.  A default fair slice is dynamic and is compared only when
@@ -134,16 +135,19 @@ static int pvsched_apply(struct pvsched_runner_runtime *runtime,
 	if (pvsched_prio_equal(&runtime->applied, prio))
 		return 0;
 #if IS_ENABLED(CONFIG_KUNIT)
-	runtime->setter_calls++;
+	if (runtime->test_setattr)
+		ret = runtime->test_setattr(runtime->attachment.task, &attr,
+					    runtime->test_setattr_data);
+	else
 #endif
-	ret = sched_setattr_nocheck_nopi(runtime->task, &attr);
+		ret = sched_setattr_nocheck_nopi(runtime->attachment.task, &attr);
 	if (ret)
 		return ret;
 	/* Only RT policy entry clears task timer slack, so restore after FIFO. */
 	if (runtime->applied.sched_policy == SCHED_FIFO &&
 	    (prio->sched_policy == SCHED_NORMAL ||
 	     prio->sched_policy == SCHED_IDLE))
-		sched_set_task_timer_slack(runtime->task,
+		sched_set_task_timer_slack(runtime->attachment.task,
 					   runtime->baseline.timer_slack_ns);
 	/* FIFO and IDLE retain the latent fair nice rather than changing it. */
 	if (prio->sched_policy == SCHED_NORMAL)
@@ -220,7 +224,7 @@ pvsched_sample(struct pvsched_runner_runtime *runtime, bool force_runtime)
 	return (struct pvsched_runtime_sample) {
 		.wall_ns = ktime_get_ns(),
 		.runtime_ns = drain || force_runtime ?
-			      task_sched_runtime(runtime->task) : 0,
+			      task_sched_runtime(runtime->attachment.task) : 0,
 		.runtime_valid = drain || force_runtime,
 	};
 }
@@ -240,7 +244,7 @@ static int pvsched_restore_locked(struct pvsched_runner_runtime *runtime)
 /* Stop service: close admission, drop the cutoff and host-initiated boost. */
 static void pvsched_deactivate_locked(struct pvsched_runner_runtime *runtime)
 {
-	runtime->active = false;
+	pvsched_attachment_disable_locked(&runtime->attachment);
 	hrtimer_try_to_cancel(&runtime->cutoff_timer);
 	pvsched_reset_host_initiated_boost_locked(runtime);
 }
@@ -281,56 +285,62 @@ int pvsched_runner_runtime_init(struct pvsched_runner_runtime *runtime,
 	if (!ticket_owner)
 		return -EINVAL;
 	memset(runtime, 0, sizeof(*runtime));
-	raw_spin_lock_init(&runtime->state_lock);
 	hrtimer_setup(&runtime->cutoff_timer, pvsched_cutoff_timer,
 		      CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED_HARD);
-	get_task_struct(task);
-	runtime->task = task;
-	runtime->generation = generation;
+	ret = pvsched_attachment_init(&runtime->attachment, task);
+	if (ret)
+		return ret;
 	runtime->config = *config;
 	runtime->ticket_owner = ticket_owner;
 	runtime->deboost_notify = deboost_notify;
-	runtime->position = PVSCHED_RUNNER_QEMU;
 	sched_get_task_state(task, &runtime->baseline);
+	baseline = pvsched_baseline_prio(runtime);
+	runtime->applied = baseline;
+	runtime->expected_nice = runtime->baseline.nice;
 	if (runtime->baseline.policy != SCHED_NORMAL ||
 	    runtime->baseline.reset_on_fork || runtime->baseline.scx_active) {
 		ret = -EOPNOTSUPP;
 		goto err_put;
 	}
-	baseline = pvsched_baseline_prio(runtime);
-	runtime->applied = baseline;
-	runtime->expected_nice = runtime->baseline.nice;
 	ret = pvsched_runtime_accounting_init(&runtime->accounting, cs_budget_ns,
 					      generic_budget_ns, ktime_get_ns());
 	if (ret)
 		goto err_put;
-	runtime->active = true;
-	return 0;
+	ret = pvsched_attachment_publish(&runtime->attachment, NULL, NULL);
+	if (!ret)
+		return 0;
 
 err_put:
-	put_task_struct(runtime->task);
-	runtime->task = NULL;
+	pvsched_runner_runtime_abort(runtime);
 	return ret;
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_init);
 
-void pvsched_runner_runtime_destroy(struct pvsched_runner_runtime *runtime)
+void pvsched_runner_runtime_gate(struct pvsched_runner_runtime *runtime)
+{
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&runtime->attachment.state_lock, flags);
+	runtime->closing = true;
+	pvsched_attachment_disable_locked(&runtime->attachment);
+	raw_spin_unlock_irqrestore(&runtime->attachment.state_lock, flags);
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_gate);
+
+void pvsched_runner_runtime_finish_close(struct pvsched_runner_runtime *runtime)
 {
 	struct pvsched_prio_desc baseline;
 	unsigned long flags;
 	int ret;
 
-	/* Close admission before synchronously waiting for a timer callback. */
-	raw_spin_lock_irqsave(&runtime->state_lock, flags);
-	runtime->closing = true;
-	runtime->active = false;
-	raw_spin_unlock_irqrestore(&runtime->state_lock, flags);
+	/* Admission must be disabled before synchronously waiting for callbacks. */
+	WARN_ON_ONCE(!runtime->closing);
 	hrtimer_cancel(&runtime->cutoff_timer);
 
-	raw_spin_lock_irqsave(&runtime->state_lock, flags);
+	raw_spin_lock_irqsave(&runtime->attachment.state_lock, flags);
 	/* sched_process_exit makes scheduler restoration both unsafe and moot. */
-	if (!runtime->exited) {
-		runtime->restore_owed_error = 0;
+	if (!runtime->attachment.exited) {
+		runtime->attachment.restore_owed = false;
 		baseline = pvsched_baseline_prio(runtime);
 		if (!pvsched_prio_equal(&runtime->applied, &baseline)) {
 			ret = pvsched_restore_locked(runtime);
@@ -338,15 +348,38 @@ void pvsched_runner_runtime_destroy(struct pvsched_runner_runtime *runtime)
 				/* Activation wiring must copy this fault to persistent state. */
 				runtime->last_fault = ret;
 				pr_err_ratelimited("pvsched: failed to restore runner %d during teardown: %d\n",
-						   task_pid_nr(runtime->task), ret);
+						   task_pid_nr(runtime->attachment.task), ret);
 			}
 		}
 	}
-	raw_spin_unlock_irqrestore(&runtime->state_lock, flags);
-	put_task_struct(runtime->task);
-	runtime->task = NULL;
+	raw_spin_unlock_irqrestore(&runtime->attachment.state_lock, flags);
+	pvsched_attachment_unhash(&runtime->attachment);
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_finish_close);
+
+void pvsched_runner_runtime_release(struct pvsched_runner_runtime *runtime)
+{
+	pvsched_attachment_release(&runtime->attachment);
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_release);
+
+void pvsched_runner_runtime_destroy(struct pvsched_runner_runtime *runtime)
+{
+	pvsched_runner_runtime_abort(runtime);
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_destroy);
+
+void pvsched_runner_runtime_abort(struct pvsched_runner_runtime *runtime)
+{
+	bool hashed = runtime->attachment.task_hashed ||
+		      runtime->attachment.vcpu_hashed;
+
+	pvsched_runner_runtime_gate(runtime);
+	pvsched_runner_runtime_finish_close(runtime);
+	if (hashed)
+		pvsched_attachment_drain();
+	pvsched_runner_runtime_release(runtime);
+}
 
 /* A guest ack of the live ticket retires it. */
 static void
@@ -358,9 +391,10 @@ pvsched_ack_ticket_locked(struct pvsched_runner_runtime *runtime,
 		runtime->interrupt_ticket = 0;
 }
 
-int pvsched_runner_reconcile(struct pvsched_runner_runtime *runtime,
-			     enum pvsched_reconcile_event event,
-			     const struct pvsched_runner_event_input *event_input)
+static int
+pvsched_runner_reconcile_locked(struct pvsched_runner_runtime *runtime,
+				enum pvsched_reconcile_event event,
+				const struct pvsched_runner_event_input *event_input)
 {
 	struct pvsched_default_policy_result result;
 	struct pvsched_runtime_sample sample;
@@ -370,37 +404,31 @@ int pvsched_runner_reconcile(struct pvsched_runner_runtime *runtime,
 	bool old_cs_throttled, old_generic_throttled, throttled;
 	bool fresh_snapshot;
 	bool idle_hold = false;
-	unsigned long flags;
 	u64 runtime_ns, *runtime_ptr = NULL;
 	int deferred_fault;
 	int event_ret = 0;
 	int ret;
 
-	raw_spin_lock_irqsave(&runtime->state_lock, flags);
 	/* Only target-local hooks advance the runner-owned position. */
 	switch (event) {
 	case PVSCHED_RECONCILE_RUN_ENTER:
 	case PVSCHED_RECONCILE_UNHALT:
 	case PVSCHED_RECONCILE_VMEXIT:
 	case PVSCHED_RECONCILE_CANCEL:
-		runtime->position = PVSCHED_RUNNER_HOST;
+		runtime->attachment.position = PVSCHED_RUNNER_HOST;
 		break;
 	case PVSCHED_RECONCILE_HALT:
-		runtime->position = PVSCHED_RUNNER_BLOCKED;
+		runtime->attachment.position = PVSCHED_RUNNER_BLOCKED;
 		break;
 	case PVSCHED_RECONCILE_RUN_LEAVE:
-		runtime->position = PVSCHED_RUNNER_QEMU;
+		runtime->attachment.position = PVSCHED_RUNNER_QEMU;
 		break;
 	default:
 		break;
 	}
 	/* Mandatory cleanup precedes admission and policy selection. */
-	if (runtime->exited) {
+	if (runtime->attachment.exited) {
 		ret = -ESRCH;
-		goto out;
-	}
-	if (runtime->closing) {
-		ret = -ESHUTDOWN;
 		goto out;
 	}
 	if (runtime->restore_owed_error) {
@@ -417,11 +445,15 @@ int pvsched_runner_reconcile(struct pvsched_runner_runtime *runtime,
 		ret = deferred_fault;
 		goto out;
 	}
+	if (runtime->closing) {
+		ret = -ESHUTDOWN;
+		goto out;
+	}
 	if (runtime->restore_failed) {
 		ret = runtime->last_fault ?: -EIO;
 		goto out;
 	}
-	if (!runtime->active) {
+	if (!runtime->attachment.active) {
 		ret = -ESHUTDOWN;
 		goto out;
 	}
@@ -469,7 +501,7 @@ int pvsched_runner_reconcile(struct pvsched_runner_runtime *runtime,
 			goto out;
 		}
 		pr_warn_ratelimited("pvsched: runner %d: unsupported guest execution mode, revoking the attachment\n",
-				    task_pid_nr(runtime->task));
+				    task_pid_nr(runtime->attachment.task));
 		pvsched_deactivate_locked(runtime);
 		ret = pvsched_restore_locked(runtime);
 		runtime->revoke_pending = false;
@@ -485,8 +517,8 @@ int pvsched_runner_reconcile(struct pvsched_runner_runtime *runtime,
 	if (event == PVSCHED_RECONCILE_INJECT &&
 	    (runtime->nested_l2 ||
 	     pvsched_mode_nested(event_input->mode_flags) ||
-	     (runtime->position != PVSCHED_RUNNER_HOST &&
-	      runtime->position != PVSCHED_RUNNER_BLOCKED) ||
+	     (runtime->attachment.position != PVSCHED_RUNNER_HOST &&
+	      runtime->attachment.position != PVSCHED_RUNNER_BLOCKED) ||
 	     runtime->accounting.phase != PVSCHED_RUNTIME_HOST ||
 	     !runtime->last_guest_area_valid)) {
 		ret = 0;
@@ -556,7 +588,7 @@ int pvsched_runner_reconcile(struct pvsched_runner_runtime *runtime,
 			if (!throttled)
 				runtime->reasons |= PVSCHED_RUNNER_REASON_INJECT;
 			input = &runtime->last_guest_area;
-			if (runtime->position == PVSCHED_RUNNER_BLOCKED) {
+			if (runtime->attachment.position == PVSCHED_RUNNER_BLOCKED) {
 				ret = 0;
 				goto out;
 			}
@@ -631,7 +663,7 @@ selected:
 	}
 	if (runtime->accounting.domain == PVSCHED_BUDGET_REFILL &&
 	    domain != PVSCHED_BUDGET_REFILL) {
-		runtime_ns = task_sched_runtime(runtime->task);
+		runtime_ns = task_sched_runtime(runtime->attachment.task);
 		runtime_ptr = &runtime_ns;
 	}
 	ret = pvsched_apply(runtime, &target);
@@ -658,7 +690,19 @@ internal_fault:
 	/* An internal failure must not leave an owned elevated tuple applied. */
 	ret = pvsched_fail_locked(runtime, ret);
 out:
-	raw_spin_unlock_irqrestore(&runtime->state_lock, flags);
+	return ret;
+}
+
+int pvsched_runner_reconcile(struct pvsched_runner_runtime *runtime,
+			     enum pvsched_reconcile_event event,
+			     const struct pvsched_runner_event_input *event_input)
+{
+	unsigned long flags;
+	int ret;
+
+	raw_spin_lock_irqsave(&runtime->attachment.state_lock, flags);
+	ret = pvsched_runner_reconcile_locked(runtime, event, event_input);
+	raw_spin_unlock_irqrestore(&runtime->attachment.state_lock, flags);
 	return ret;
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_reconcile);
@@ -705,27 +749,27 @@ pvsched_publish_applied_locked(const struct pvsched_runner_runtime *runtime,
 		   runtime->interrupt_ticket);
 }
 
-int pvsched_runner_vmentry(struct pvsched_runner_runtime *runtime,
-			   const struct pvsched_runner_vmentry_input *input,
-			   struct pvsched_host_area *host)
+static int
+pvsched_runner_vmentry_locked(struct pvsched_runner_runtime *runtime,
+			      const struct pvsched_runner_vmentry_input *input,
+			      struct pvsched_host_area *host)
 {
 	struct pvsched_runtime_sample sample;
 	bool had_host_reason, nested;
 	bool was_host;
-	unsigned long flags;
 	int ret = -ESHUTDOWN;
 
-	raw_spin_lock_irqsave(&runtime->state_lock, flags);
-	runtime->position = PVSCHED_RUNNER_GUEST;
+	runtime->attachment.position = PVSCHED_RUNNER_GUEST;
 	nested = pvsched_mode_nested(input->mode_flags);
 	runtime->nested_l2 = nested;
 	if (runtime->restore_owed_error && !runtime->closing &&
-	    !runtime->exited) {
+	    !runtime->attachment.exited) {
 		/* Fast reentry cannot restore, but must re-arm the immediate kick. */
 		hrtimer_start(&runtime->cutoff_timer, ns_to_ktime(0),
 			      HRTIMER_MODE_REL_PINNED_HARD);
 		ret = runtime->restore_owed_error;
-	} else if (runtime->active && !runtime->closing && !runtime->exited &&
+	} else if (runtime->attachment.active && !runtime->closing &&
+		   !runtime->attachment.exited &&
 		   !runtime->restore_failed) {
 		was_host = runtime->accounting.phase == PVSCHED_RUNTIME_HOST;
 		sample = pvsched_sample(runtime, false);
@@ -735,7 +779,7 @@ int pvsched_runner_vmentry(struct pvsched_runner_runtime *runtime,
 			 * Late VMENTRY follows KVM's final reschedule check, so a setter
 			 * cannot safely take effect before entry.  Defer restoration.
 			 */
-			runtime->active = false;
+			pvsched_attachment_disable_locked(&runtime->attachment);
 			runtime->last_fault = ret;
 			runtime->restore_owed_error = ret;
 			hrtimer_start(&runtime->cutoff_timer, ns_to_ktime(0),
@@ -795,10 +839,142 @@ int pvsched_runner_vmentry(struct pvsched_runner_runtime *runtime,
 		}
 	}
 unlock:
-	raw_spin_unlock_irqrestore(&runtime->state_lock, flags);
+	return ret;
+}
+
+int pvsched_runner_vmentry(struct pvsched_runner_runtime *runtime,
+			   const struct pvsched_runner_vmentry_input *input,
+			   struct pvsched_host_area *host)
+{
+	unsigned long flags;
+	int ret;
+
+	raw_spin_lock_irqsave(&runtime->attachment.state_lock, flags);
+	ret = pvsched_runner_vmentry_locked(runtime, input, host);
+	raw_spin_unlock_irqrestore(&runtime->attachment.state_lock, flags);
 	return ret;
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_vmentry);
+
+struct pvsched_runner_local_reconcile_ctx {
+	enum pvsched_reconcile_event event;
+	const struct pvsched_runner_event_input *input;
+	int ret;
+};
+
+static void
+pvsched_runner_local_reconcile_visit(struct pvsched_attachment *attachment,
+				     enum pvsched_attachment_visit_kind kind,
+				     void *data)
+{
+	struct pvsched_runner_local_reconcile_ctx *ctx = data;
+	struct pvsched_runner_runtime *runtime =
+		container_of(attachment, struct pvsched_runner_runtime, attachment);
+
+	/* A failed binding is reported, not recorded as the runner's fault. */
+	if (kind == PVSCHED_ATTACHMENT_VISIT_BINDING_FAILED)
+		runtime->restore_owed_error = -ESTALE;
+	ctx->ret = pvsched_runner_reconcile_locked(runtime, ctx->event,
+						   ctx->input);
+}
+
+int pvsched_runner_local_reconcile(const void *vcpu_key,
+				   enum pvsched_reconcile_event event,
+				   const struct pvsched_runner_event_input *input)
+{
+	struct pvsched_runner_local_reconcile_ctx ctx = {
+		.event = event,
+		.input = input,
+		.ret = -ENOENT,
+	};
+	enum pvsched_runner_position position;
+
+	switch (event) {
+	case PVSCHED_RECONCILE_HALT:
+		position = PVSCHED_RUNNER_BLOCKED;
+		break;
+	case PVSCHED_RECONCILE_RUN_LEAVE:
+		position = PVSCHED_RUNNER_QEMU;
+		break;
+	default:
+		position = PVSCHED_RUNNER_HOST;
+		break;
+	}
+	pvsched_attachment_local_visit(vcpu_key, position,
+		input ? input->mode_flags : 0,
+		pvsched_runner_local_reconcile_visit, &ctx);
+	return ctx.ret;
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_local_reconcile);
+
+int pvsched_runner_cleanup_reconcile(struct task_struct *task,
+				     enum pvsched_reconcile_event event,
+				     const struct pvsched_runner_event_input *input)
+{
+	struct pvsched_runner_local_reconcile_ctx ctx = {
+		.event = event,
+		.input = input,
+		.ret = -ENOENT,
+	};
+
+	pvsched_attachment_cleanup_visit(task,
+		pvsched_runner_local_reconcile_visit, &ctx);
+	return ctx.ret;
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_cleanup_reconcile);
+
+struct pvsched_runner_local_vmentry_ctx {
+	const struct pvsched_runner_vmentry_input *input;
+	struct pvsched_host_area *host;
+	int ret;
+};
+
+static void
+pvsched_runner_local_vmentry_visit(struct pvsched_attachment *attachment,
+				   enum pvsched_attachment_visit_kind kind,
+				   void *data)
+{
+	struct pvsched_runner_local_vmentry_ctx *ctx = data;
+	struct pvsched_runner_runtime *runtime =
+		container_of(attachment, struct pvsched_runner_runtime, attachment);
+
+	/* A failed binding is reported, not recorded as the runner's fault. */
+	if (kind == PVSCHED_ATTACHMENT_VISIT_BINDING_FAILED)
+		runtime->restore_owed_error = -ESTALE;
+	ctx->ret = pvsched_runner_vmentry_locked(runtime, ctx->input, ctx->host);
+}
+
+int pvsched_runner_local_vmentry(const void *vcpu_key,
+				 const struct pvsched_runner_vmentry_input *input,
+				 struct pvsched_host_area *host)
+{
+	struct pvsched_runner_local_vmentry_ctx ctx = {
+		.input = input,
+		.host = host,
+		.ret = -ENOENT,
+	};
+
+	pvsched_attachment_local_visit(vcpu_key, PVSCHED_RUNNER_GUEST,
+		input->mode_flags, pvsched_runner_local_vmentry_visit, &ctx);
+	return ctx.ret;
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_local_vmentry);
+
+int pvsched_runner_cleanup_vmentry(struct task_struct *task,
+				   const struct pvsched_runner_vmentry_input *input,
+				   struct pvsched_host_area *host)
+{
+	struct pvsched_runner_local_vmentry_ctx ctx = {
+		.input = input,
+		.host = host,
+		.ret = -ENOENT,
+	};
+
+	pvsched_attachment_cleanup_visit(task,
+		pvsched_runner_local_vmentry_visit, &ctx);
+	return ctx.ret;
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_cleanup_vmentry);
 
 void pvsched_runner_guest_exit_irqoff(struct pvsched_runner_runtime *runtime)
 {
