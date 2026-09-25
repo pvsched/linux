@@ -2300,6 +2300,17 @@ config PVSCHED_RUNNER_RUNTIME_KUNIT_TEST
 
 	  If unsure, say N.
 
+config PVSCHED_ATTACHMENT_KUNIT_TEST
+	tristate "KUnit test for pvsched attachment indexes" if !KUNIT_ALL_TESTS
+	depends on KUNIT && PVSCHED
+	default KUNIT_ALL_TESTS
+	help
+	  Exercise the exact-task and opaque-vCPU RCU indexes, immutable
+	  vCPU binding, common position, admission gate and cleanup visibility.
+	  These tests require no KVM, probe registration or shared test VM.
+
+	  If unsure, say N.
+
 config TEST_LIST_SORT
 	tristate "Linked list sorting test" if !KUNIT_ALL_TESTS
 	depends on KUNIT
