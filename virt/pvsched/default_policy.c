@@ -183,7 +183,7 @@ EXPORT_SYMBOL_IF_KUNIT(pvsched_default_policy_select);
 
 /*
  * Charge by what the tuple is for: validation makes cs_rt_prio strictly
- * higher than every other priority, so only CS selects it.
+ * higher than every other priority, so only CS and host reasons select it.
  */
 static enum pvsched_boost_class
 pvsched_default_policy_class(const struct pvsched_default_policy_config *config,
@@ -221,6 +221,25 @@ static int pvsched_default_ops_capture(struct pvsched_policy_ctx *ctx,
 	return 0;
 }
 
+/*
+ * An idle guest is heading to a halt, where the HLT exit and HALT keep it
+ * boosted until it blocks.  Deboosting it on the way, at another exit,
+ * lets a host task preempt it while its guest timer runs on a timer the
+ * host cannot see, so it would wait a whole slice.  The same applies just
+ * after a wake: the guest's idle task handles the wakeup before it switches
+ * to the woken task, and a deboost there lets a host task run first.  So
+ * when the framework offers the hold, keep an applied FIFO boost rather
+ * than lower it.
+ */
+static bool pvsched_default_ops_hold(const struct pvsched_map_input *in,
+				     const struct pvsched_prio_desc *applied,
+				     const struct pvsched_prio_desc *target)
+{
+	return in->hold_offered && applied->sched_policy == SCHED_FIFO &&
+	       !(target->sched_policy == SCHED_FIFO &&
+		 target->rt_prio >= applied->rt_prio);
+}
+
 static int pvsched_default_ops_map(struct pvsched_policy_ctx *ctx,
 				   const struct pvsched_map_input *in,
 				   void *out, enum pvsched_boost_class *class,
@@ -229,6 +248,7 @@ static int pvsched_default_ops_map(struct pvsched_policy_ctx *ctx,
 	struct pvsched_default_policy_config config =
 		pvsched_default_policy_get_config();
 	const struct pvsched_default_params *baseline = ctx->baseline;
+	const struct pvsched_default_params *applied = ctx->applied;
 	struct pvsched_default_params *params = out;
 	struct pvsched_default_policy_result result;
 	int ret;
@@ -240,6 +260,16 @@ static int pvsched_default_ops_map(struct pvsched_policy_ctx *ctx,
 		return ret;
 	*params = *baseline;
 	params->prio = result.prio;
+	if ((in->reasons || in->ticket_live) &&
+	    !in->cs_throttled && !in->generic_throttled)
+		params->prio = (struct pvsched_prio_desc) {
+			.sched_policy = SCHED_FIFO,
+			.rt_prio = config.cs_rt_prio,
+		};
+	if (pvsched_default_ops_hold(in, &applied->prio, &params->prio)) {
+		*params = *applied;
+		*out_flags |= PVSCHED_MAP_HELD;
+	}
 	*class = pvsched_default_policy_class(&config, baseline->prio.nice,
 					      &params->prio);
 	return 0;
