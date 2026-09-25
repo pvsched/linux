@@ -7,13 +7,29 @@
 #include <linux/string.h>
 #include <kunit/visibility.h>
 #include <uapi/linux/sched/types.h>
-
 #include "runner_runtime.h"
 
 static enum hrtimer_restart pvsched_cutoff_timer(struct hrtimer *timer)
 {
 	/* The interrupt's only job is to force a prompt nonfast KVM exit. */
 	return HRTIMER_NORESTART;
+}
+
+static bool pvsched_mode_supported(u32 mode_flags)
+{
+	return !(mode_flags & PVSCHED_RUNNER_MODE_UNSUPPORTED);
+}
+
+static bool pvsched_mode_nested(u32 mode_flags)
+{
+	return mode_flags & PVSCHED_RUNNER_MODE_NESTED;
+}
+
+static void
+pvsched_reset_host_initiated_boost_locked(struct pvsched_runner_runtime *runtime)
+{
+	runtime->interrupt_ticket = 0;
+	runtime->reasons = 0;
 }
 
 static u64 pvsched_budget_remaining(const struct pvsched_budget *budget)
@@ -37,6 +53,18 @@ static void pvsched_arm_cutoff_locked(struct pvsched_runner_runtime *runtime)
 		break;
 	default:
 		return;
+	}
+
+	/*
+	 * A held boost ends at its grace deadline even with budget left.  Only
+	 * a boost that is held right now is capped: a stale deadline must never
+	 * force an exit, or the guest could not run to change what it asks for.
+	 */
+	if (runtime->idle_holding) {
+		u64 now = ktime_get_ns();
+
+		remaining = min(remaining, runtime->idle_hold_end_ns > now ?
+				runtime->idle_hold_end_ns - now : 0);
 	}
 
 	/* A latched budget yields zero: request an immediate nonfast exit. */
@@ -70,7 +98,7 @@ static bool pvsched_owned_state(const struct pvsched_runner_runtime *runtime)
 	 * FIFO and IDLE leave fair nice latent, so compare the value last applied
 	 * under NORMAL.  A default fair slice is dynamic and is compared only when
 	 * ATTACH captured an explicit slice.  These checks make administrator
-	 * setpriority(), chrt, or slice changes an external owner.
+	 * setpriority(), chrt, or slice changes establish an external owner.
 	 */
 	return state.policy == runtime->applied.sched_policy &&
 	       state.nice == runtime->expected_nice &&
@@ -100,7 +128,7 @@ static int pvsched_apply(struct pvsched_runner_runtime *runtime,
 	    runtime->baseline.custom_slice)
 		attr.sched_runtime = runtime->baseline.slice_ns;
 
-	/* Ownership intentionally precedes the same-tuple skip. */
+	/* Recheck ownership under the runner lock before the same-tuple skip. */
 	if (!pvsched_owned_state(runtime))
 		return -EOWNERDEAD;
 	if (pvsched_prio_equal(&runtime->applied, prio))
@@ -123,9 +151,54 @@ static int pvsched_apply(struct pvsched_runner_runtime *runtime,
 	return 0;
 }
 
+static void pvsched_idle_hold_reset(struct pvsched_runner_runtime *runtime)
+{
+	runtime->idle_hold_end_ns = 0;
+	runtime->idle_holding = false;
+}
+
+/*
+ * An idle guest is heading to a halt, where the HLT exit and HALT keep it
+ * boosted until it blocks.  Deboosting it on the way, at another exit,
+ * lets a host task preempt it while its guest timer runs on a timer the
+ * host cannot see, so it would wait a whole slice.  The same applies just
+ * after a wake: the guest's idle task handles the wakeup before it switches
+ * to the woken task, and a deboost there lets a host task run first.  Keep
+ * the applied FIFO boost instead, for at most one short grace per idle
+ * episode; the caller charges it to the CS budget.  An episode ends when the
+ * guest leaves idle, at a halt or wake, or on a return to the VMM.  Returns
+ * true when @target was replaced.
+ */
+static bool pvsched_idle_hold_locked(struct pvsched_runner_runtime *runtime,
+				     enum pvsched_reconcile_event event,
+				     const struct pvsched_default_guest_area *input,
+				     struct pvsched_prio_desc *target,
+				     bool throttled, u64 now)
+{
+	const struct pvsched_prio_desc *applied = &runtime->applied;
+	u64 end = runtime->idle_hold_end_ns;
+
+	if (!(input->task_intent.flags & PVSCHED_INTENT_FLAG_IDLE)) {
+		pvsched_idle_hold_reset(runtime);
+		return false;
+	}
+	/* A grace that has passed stays spent until the guest leaves idle. */
+	if ((event != PVSCHED_RECONCILE_VMEXIT &&
+	     event != PVSCHED_RECONCILE_CANCEL) ||
+	    !runtime->idle_hold_ns || throttled || (end && now >= end) ||
+	    applied->sched_policy != SCHED_FIFO ||
+	    (target->sched_policy == SCHED_FIFO &&
+	     target->rt_prio >= applied->rt_prio))
+		return false;
+	if (!end)
+		runtime->idle_hold_end_ns = now + runtime->idle_hold_ns;
+	*target = *applied;
+	return true;
+}
+
 static enum pvsched_budget_account
 pvsched_charge_class(const struct pvsched_runner_runtime *runtime,
-			     const struct pvsched_prio_desc *prio)
+		     const struct pvsched_prio_desc *prio)
 {
 	/* Validation makes cs_rt_prio strictly higher than every other class. */
 	if (prio->sched_policy == SCHED_FIFO &&
@@ -164,17 +237,26 @@ static int pvsched_restore_locked(struct pvsched_runner_runtime *runtime)
 	return ret;
 }
 
+/* Stop service: close admission, drop the cutoff and host-initiated boost. */
+static void pvsched_deactivate_locked(struct pvsched_runner_runtime *runtime)
+{
+	runtime->active = false;
+	hrtimer_try_to_cancel(&runtime->cutoff_timer);
+	pvsched_reset_host_initiated_boost_locked(runtime);
+}
+
 static int pvsched_fail_locked(struct pvsched_runner_runtime *runtime, int ret)
 {
 	int restore_ret;
 
-	runtime->active = false;
-	hrtimer_try_to_cancel(&runtime->cutoff_timer);
 	/* External ownership is neither our fault nor ours to restore. */
-	if (ret == -EOWNERDEAD)
+	if (ret == -EOWNERDEAD) {
+		pvsched_deactivate_locked(runtime);
 		return ret;
+	}
 	runtime->last_fault = ret;
 	/* One bounded restore attempt; failure is terminal until teardown. */
+	pvsched_deactivate_locked(runtime);
 	restore_ret = pvsched_restore_locked(runtime);
 	if (restore_ret == -EOWNERDEAD)
 		return ret;
@@ -189,11 +271,15 @@ static int pvsched_fail_locked(struct pvsched_runner_runtime *runtime, int ret)
 int pvsched_runner_runtime_init(struct pvsched_runner_runtime *runtime,
 				struct task_struct *task, u64 generation,
 				const struct pvsched_default_policy_config *config,
-				u64 cs_budget_ns, u64 generic_budget_ns)
+				u64 cs_budget_ns, u64 generic_budget_ns,
+				struct pvsched_ticket_owner *ticket_owner,
+				bool deboost_notify)
 {
 	struct pvsched_prio_desc baseline;
 	int ret;
 
+	if (!ticket_owner)
+		return -EINVAL;
 	memset(runtime, 0, sizeof(*runtime));
 	raw_spin_lock_init(&runtime->state_lock);
 	hrtimer_setup(&runtime->cutoff_timer, pvsched_cutoff_timer,
@@ -202,6 +288,9 @@ int pvsched_runner_runtime_init(struct pvsched_runner_runtime *runtime,
 	runtime->task = task;
 	runtime->generation = generation;
 	runtime->config = *config;
+	runtime->ticket_owner = ticket_owner;
+	runtime->deboost_notify = deboost_notify;
+	runtime->position = PVSCHED_RUNNER_QEMU;
 	sched_get_task_state(task, &runtime->baseline);
 	if (runtime->baseline.policy != SCHED_NORMAL ||
 	    runtime->baseline.reset_on_fork || runtime->baseline.scx_active) {
@@ -259,16 +348,28 @@ void pvsched_runner_runtime_destroy(struct pvsched_runner_runtime *runtime)
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_destroy);
 
+/* A guest ack of the live ticket retires it. */
+static void
+pvsched_ack_ticket_locked(struct pvsched_runner_runtime *runtime,
+			  const struct pvsched_default_guest_area *guest)
+{
+	if (runtime->interrupt_ticket &&
+	    READ_ONCE(guest->interrupt_ack) == runtime->interrupt_ticket)
+		runtime->interrupt_ticket = 0;
+}
+
 int pvsched_runner_reconcile(struct pvsched_runner_runtime *runtime,
 			     enum pvsched_reconcile_event event,
-			     const struct pvsched_default_guest_area *guest)
+			     const struct pvsched_runner_event_input *event_input)
 {
 	struct pvsched_default_policy_result result;
 	struct pvsched_runtime_sample sample;
-	const struct pvsched_default_guest_area *input = guest;
+	const struct pvsched_default_guest_area *input;
 	struct pvsched_prio_desc target;
 	enum pvsched_budget_account domain;
-	bool old_cs_throttled, old_generic_throttled;
+	bool old_cs_throttled, old_generic_throttled, throttled;
+	bool fresh_snapshot;
+	bool idle_hold = false;
 	unsigned long flags;
 	u64 runtime_ns, *runtime_ptr = NULL;
 	int deferred_fault;
@@ -276,9 +377,30 @@ int pvsched_runner_reconcile(struct pvsched_runner_runtime *runtime,
 	int ret;
 
 	raw_spin_lock_irqsave(&runtime->state_lock, flags);
+	/* Only target-local hooks advance the runner-owned position. */
+	switch (event) {
+	case PVSCHED_RECONCILE_RUN_ENTER:
+	case PVSCHED_RECONCILE_UNHALT:
+	case PVSCHED_RECONCILE_VMEXIT:
+	case PVSCHED_RECONCILE_CANCEL:
+		runtime->position = PVSCHED_RUNNER_HOST;
+		break;
+	case PVSCHED_RECONCILE_HALT:
+		runtime->position = PVSCHED_RUNNER_BLOCKED;
+		break;
+	case PVSCHED_RECONCILE_RUN_LEAVE:
+		runtime->position = PVSCHED_RUNNER_QEMU;
+		break;
+	default:
+		break;
+	}
 	/* Mandatory cleanup precedes admission and policy selection. */
 	if (runtime->exited) {
 		ret = -ESRCH;
+		goto out;
+	}
+	if (runtime->closing) {
+		ret = -ESHUTDOWN;
 		goto out;
 	}
 	if (runtime->restore_owed_error) {
@@ -299,7 +421,7 @@ int pvsched_runner_reconcile(struct pvsched_runner_runtime *runtime,
 		ret = runtime->last_fault ?: -EIO;
 		goto out;
 	}
-	if (runtime->closing || !runtime->active) {
+	if (!runtime->active) {
 		ret = -ESHUTDOWN;
 		goto out;
 	}
@@ -308,9 +430,66 @@ int pvsched_runner_reconcile(struct pvsched_runner_runtime *runtime,
 	case PVSCHED_RECONCILE_VMEXIT:
 	case PVSCHED_RECONCILE_CANCEL:
 	case PVSCHED_RECONCILE_RUN_LEAVE:
+	case PVSCHED_RECONCILE_HALT:
+	case PVSCHED_RECONCILE_UNHALT:
+	case PVSCHED_RECONCILE_INJECT:
 		break;
 	default:
 		ret = -EINVAL;
+		goto out;
+	}
+	if (!event_input) {
+		WARN_ON_ONCE(1);
+		ret = -EINVAL;
+		goto out;
+	}
+	input = event_input->guest;
+	if (event == PVSCHED_RECONCILE_INJECT &&
+	    !pvsched_mode_supported(event_input->mode_flags)) {
+		/*
+		 * Remote mode facts are only hints.  Ignore an unsupported INJECT
+		 * and let the target's own hooks, which see fresh facts, start
+		 * revocation.
+		 */
+		ret = 0;
+		goto out;
+	}
+	/*
+	 * An unsupported mode revokes this attachment: stop new assistance and
+	 * mark revocation owed.  Local checkpoints then restore the baseline
+	 * below.
+	 */
+	if (!pvsched_mode_supported(event_input->mode_flags)) {
+		pvsched_reset_host_initiated_boost_locked(runtime);
+		runtime->revoke_pending = true;
+	}
+	if (runtime->revoke_pending) {
+		if (event == PVSCHED_RECONCILE_INJECT) {
+			ret = 0;
+			goto out;
+		}
+		pr_warn_ratelimited("pvsched: runner %d: unsupported guest execution mode, revoking the attachment\n",
+				    task_pid_nr(runtime->task));
+		pvsched_deactivate_locked(runtime);
+		ret = pvsched_restore_locked(runtime);
+		runtime->revoke_pending = false;
+		if (WARN_ON_ONCE(ret && ret != -EOWNERDEAD)) {
+			runtime->restore_failed = true;
+			runtime->last_fault = ret;
+		}
+		if (!ret)
+			ret = -EOPNOTSUPP;
+		goto out;
+	}
+	/* Ineligible producer facts must not touch the target's open interval. */
+	if (event == PVSCHED_RECONCILE_INJECT &&
+	    (runtime->nested_l2 ||
+	     pvsched_mode_nested(event_input->mode_flags) ||
+	     (runtime->position != PVSCHED_RUNNER_HOST &&
+	      runtime->position != PVSCHED_RUNNER_BLOCKED) ||
+	     runtime->accounting.phase != PVSCHED_RUNTIME_HOST ||
+	     !runtime->last_guest_area_valid)) {
+		ret = 0;
 		goto out;
 	}
 	sample = pvsched_sample(runtime, false);
@@ -325,49 +504,123 @@ int pvsched_runner_reconcile(struct pvsched_runner_runtime *runtime,
 	old_cs_throttled = runtime->accounting.accounting.cs.throttled;
 	old_generic_throttled =
 		runtime->accounting.accounting.generic.throttled;
+	throttled = old_cs_throttled || old_generic_throttled;
+	if (throttled)
+		pvsched_reset_host_initiated_boost_locked(runtime);
+	if (event == PVSCHED_RECONCILE_UNHALT) {
+		/*
+		 * Balance sleep; do not manufacture a fresh post-wake boost.  A
+		 * wake starts a new idle episode: until the guest switches to
+		 * the woken task, the idle hold may keep the halt boost.
+		 */
+		pvsched_idle_hold_reset(runtime);
+		target = throttled ? pvsched_baseline_prio(runtime) :
+				     runtime->applied;
+		goto selected;
+	}
 
 	if (event == PVSCHED_RECONCILE_RUN_LEAVE) {
+		pvsched_idle_hold_reset(runtime);
 		/* GUEST may remain open on a terminal path lacking IRQ-on VMEXIT. */
-		/* Do not leave a cutoff armed while the runner returns to QEMU. */
 		hrtimer_try_to_cancel(&runtime->cutoff_timer);
+		runtime->reasons = 0;
 		target = pvsched_baseline_prio(runtime);
-	} else {
-		if (runtime->nested_l2) {
+		goto selected;
+	}
+
+	if (event != PVSCHED_RECONCILE_INJECT)
+		runtime->nested_l2 = pvsched_mode_nested(event_input->mode_flags);
+	/* Only a non-nested local event supplies a fresh guest snapshot. */
+	fresh_snapshot = !runtime->nested_l2 && event != PVSCHED_RECONCILE_INJECT;
+	if (fresh_snapshot && input)
+		pvsched_ack_ticket_locked(runtime, input);
+	if (!runtime->nested_l2) {
+		switch (event) {
+		case PVSCHED_RECONCILE_VMEXIT:
 			/*
-			 * The shared CS word describes the preempt-disabled L2 entry path,
-			 * not guest intent throughout L2.  Reuse the last non-nested
-			 * selection snapshot rather than manufacturing a CS boost.
+			 * Boost a halting vCPU from its HLT exit, not only at
+			 * HALT: a deboost here would let a host task preempt it
+			 * before it blocks, and a guest timer that expires while
+			 * it waits raises no host event to boost it again.
 			 */
-			if (!runtime->last_guest_area_valid) {
-				/* Mid-L2 attachment has no snapshot, so use baseline. */
-				target = pvsched_baseline_prio(runtime);
-				event_ret = -EINVAL;
-				goto selected;
-			}
+			if (!(event_input->mode_flags & PVSCHED_RUNNER_MODE_HLT_EXIT))
+				break;
+			fallthrough;
+		case PVSCHED_RECONCILE_HALT:
+			/* The halt ends this idle episode's grace. */
+			pvsched_idle_hold_reset(runtime);
+			if (!throttled)
+				runtime->reasons |= PVSCHED_RUNNER_REASON_HALT;
+			break;
+		case PVSCHED_RECONCILE_INJECT:
+			if (!throttled)
+				runtime->reasons |= PVSCHED_RUNNER_REASON_INJECT;
 			input = &runtime->last_guest_area;
-		} else if (input) {
-			runtime->last_guest_area = *input;
-			runtime->last_guest_area_valid = true;
-		}
-		if (!input) {
-			ret = -EINVAL;
-			goto internal_fault;
-		}
-		ret = pvsched_default_policy_select(&runtime->config,
-					runtime->baseline.nice, input,
-					old_cs_throttled,
-					old_generic_throttled, &result);
-		if (ret) {
-			/* Malformed guest data is event-local, not a runner fault. */
-			target = pvsched_baseline_prio(runtime);
-			event_ret = ret;
-		} else {
-			target = result.prio;
+			if (runtime->position == PVSCHED_RUNNER_BLOCKED) {
+				ret = 0;
+				goto out;
+			}
+			break;
+		default:
+			break;
 		}
 	}
 
+	if (runtime->nested_l2) {
+		/*
+		 * The shared CS word describes the preempt-disabled L2 entry path,
+		 * not guest intent throughout L2.  Reuse the last non-nested
+		 * selection snapshot rather than manufacturing a CS boost.
+		 */
+		if (!runtime->last_guest_area_valid) {
+			/* Mid-L2 attachment has no snapshot, so use baseline. */
+			target = pvsched_baseline_prio(runtime);
+			event_ret = -EINVAL;
+			goto selected;
+		}
+		input = &runtime->last_guest_area;
+	}
+	if (!input) {
+		WARN_ON_ONCE(1);
+		runtime->last_guest_area_valid = false;
+		target = pvsched_baseline_prio(runtime);
+		event_ret = -EINVAL;
+		goto selected;
+	}
+	ret = pvsched_default_policy_select(&runtime->config,
+					    runtime->baseline.nice, input,
+					    old_cs_throttled,
+					    old_generic_throttled, &result);
+	if (ret) {
+		/* Malformed guest data is event-local, not a runner fault. */
+		if (fresh_snapshot) {
+			runtime->last_guest_area = *input;
+			runtime->last_guest_area_valid = false;
+		}
+		target = pvsched_baseline_prio(runtime);
+		event_ret = ret;
+	} else {
+		if (fresh_snapshot) {
+			runtime->last_guest_area = *input;
+			runtime->last_guest_area_valid = true;
+		}
+		target = result.prio;
+		if ((runtime->reasons || runtime->interrupt_ticket) &&
+		    !throttled)
+			target = (struct pvsched_prio_desc) {
+				.sched_policy = SCHED_FIFO,
+				.rt_prio = runtime->config.cs_rt_prio,
+			};
+		if (fresh_snapshot)
+			idle_hold = pvsched_idle_hold_locked(runtime, event,
+							     input, &target,
+							     throttled,
+							     sample.wall_ns);
+	}
+
 selected:
-	domain = pvsched_charge_class(runtime, &target);
+	domain = idle_hold ? PVSCHED_BUDGET_DRAIN_CS_GENERIC :
+		 pvsched_charge_class(runtime, &target);
 	/*
 	 * Commit can fail only outside HOST, and the settle or close above
 	 * leaves HOST; check before the setter rather than after it.
@@ -392,13 +645,16 @@ selected:
 		     (domain != PVSCHED_BUDGET_REFILL &&
 		      old_generic_throttled));
 	runtime->applied = target;
+	runtime->idle_holding = idle_hold;
 	ret = event_ret;
 	goto out;
 
 apply_fault:
+	pvsched_idle_hold_reset(runtime);
 	ret = pvsched_fail_locked(runtime, ret);
 	goto out;
 internal_fault:
+	pvsched_idle_hold_reset(runtime);
 	/* An internal failure must not leave an owned elevated tuple applied. */
 	ret = pvsched_fail_locked(runtime, ret);
 out:
@@ -407,14 +663,62 @@ out:
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_reconcile);
 
-int pvsched_runner_guest_start(struct pvsched_runner_runtime *runtime)
+/*
+ * Whether the guest's CS word (nonzero, reserved bits clear) and the budget
+ * latches allow the CS FIFO tuple.  Selection validates the rest of the guest
+ * area at the next checkpoint; the armed cutoff timer bounds the boost until
+ * then either way.
+ */
+static bool
+pvsched_guest_cs_selects_fifo(const struct pvsched_runner_runtime *runtime,
+			      const struct pvsched_runner_vmentry_input *input,
+			      bool guest_valid)
+{
+	u64 cs;
+
+	if (!guest_valid || runtime->accounting.accounting.cs.throttled ||
+	    runtime->accounting.accounting.generic.throttled)
+		return false;
+	cs = le64_to_cpu(input->guest.cs_state);
+	return cs && !(cs & PVSCHED_CS_RESERVED_MASK);
+}
+
+/*
+ * Stage the applied-state feedback and the live ticket for the page.
+ * @hint adds the cooperative deboost kick hint when it is enabled.
+ */
+static void
+pvsched_publish_applied_locked(const struct pvsched_runner_runtime *runtime,
+			       struct pvsched_host_area *host, bool hint)
+{
+	union pvsched_applied_state state = { };
+
+	state.task = runtime->applied;
+	if (hint && runtime->deboost_notify)
+		state.hints |= PVSCHED_HINT_KICK_DEBOOST;
+	if (runtime->accounting.accounting.cs.throttled)
+		state.flags |= PVSCHED_APPLIED_CS_THROTTLED;
+	if (runtime->accounting.accounting.generic.throttled)
+		state.flags |= PVSCHED_APPLIED_TOTAL_THROTTLED;
+	WRITE_ONCE(host->applied_state.raw, state.raw);
+	WRITE_ONCE(host->default_area.interrupt_ticket,
+		   runtime->interrupt_ticket);
+}
+
+int pvsched_runner_vmentry(struct pvsched_runner_runtime *runtime,
+			   const struct pvsched_runner_vmentry_input *input,
+			   struct pvsched_host_area *host)
 {
 	struct pvsched_runtime_sample sample;
+	bool had_host_reason, nested;
 	bool was_host;
 	unsigned long flags;
 	int ret = -ESHUTDOWN;
 
 	raw_spin_lock_irqsave(&runtime->state_lock, flags);
+	runtime->position = PVSCHED_RUNNER_GUEST;
+	nested = pvsched_mode_nested(input->mode_flags);
+	runtime->nested_l2 = nested;
 	if (runtime->restore_owed_error && !runtime->closing &&
 	    !runtime->exited) {
 		/* Fast reentry cannot restore, but must re-arm the immediate kick. */
@@ -440,11 +744,61 @@ int pvsched_runner_guest_start(struct pvsched_runner_runtime *runtime)
 			/* Arm only for the HOST -> GUEST transition, not fast reentry. */
 			pvsched_arm_cutoff_locked(runtime);
 		}
+		if (ret)
+			goto unlock;
+		had_host_reason = runtime->reasons || runtime->interrupt_ticket;
+		if (runtime->revoke_pending ||
+		    !pvsched_mode_supported(input->mode_flags)) {
+			/* Entry proceeds; a safe slow checkpoint performs restoration. */
+			runtime->revoke_pending = true;
+			/* This also clears the ticket, so zero is published. */
+			pvsched_reset_host_initiated_boost_locked(runtime);
+			hrtimer_start(&runtime->cutoff_timer, ns_to_ktime(0),
+				      HRTIMER_MODE_REL_PINNED_HARD);
+			pvsched_publish_applied_locked(runtime, host, false);
+			ret = 0;
+			goto unlock;
+		}
+		if (!nested) {
+			pvsched_ack_ticket_locked(runtime, &input->guest);
+			if (input->interrupt_ready) {
+				if (!runtime->interrupt_ticket &&
+				    !runtime->accounting.accounting.cs.throttled &&
+				    !runtime->accounting.accounting.generic.throttled &&
+				    !(input->mode_flags & PVSCHED_RUNNER_MODE_NO_TICKET) &&
+				    runtime->ticket_owner->last_ticket != U64_MAX) {
+					runtime->interrupt_ticket =
+						++runtime->ticket_owner->last_ticket;
+				}
+			}
+			runtime->reasons = 0;
+		}
+		if (runtime->accounting.accounting.cs.throttled ||
+		    runtime->accounting.accounting.generic.throttled) {
+			pvsched_reset_host_initiated_boost_locked(runtime);
+		}
+		/*
+		 * The last host-initiated reason just retired while CS FIFO is
+		 * applied: force an exit so a checkpoint can deboost, unless the
+		 * guest's own CS state still asks for that FIFO.
+		 */
+		if (had_host_reason && !runtime->reasons &&
+		    !runtime->interrupt_ticket &&
+		    runtime->applied.sched_policy == SCHED_FIFO &&
+		    runtime->applied.rt_prio == runtime->config.cs_rt_prio &&
+		    !pvsched_guest_cs_selects_fifo(runtime, input, !nested)) {
+			hrtimer_start(&runtime->cutoff_timer, ns_to_ktime(0),
+				      HRTIMER_MODE_REL_PINNED_HARD);
+		}
+		if (!nested) {
+			pvsched_publish_applied_locked(runtime, host, true);
+		}
 	}
+unlock:
 	raw_spin_unlock_irqrestore(&runtime->state_lock, flags);
 	return ret;
 }
-EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_guest_start);
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_vmentry);
 
 void pvsched_runner_guest_exit_irqoff(struct pvsched_runner_runtime *runtime)
 {
@@ -455,19 +809,3 @@ void pvsched_runner_guest_exit_irqoff(struct pvsched_runner_runtime *runtime)
 	hrtimer_try_to_cancel(&runtime->cutoff_timer);
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_guest_exit_irqoff);
-
-void pvsched_runner_publish_vmentry(struct pvsched_runner_runtime *runtime,
-				    struct pvsched_host_area *host)
-{
-	union pvsched_applied_state state = { };
-	unsigned long flags;
-
-	raw_spin_lock_irqsave(&runtime->state_lock, flags);
-	state.task = runtime->applied;
-	if (runtime->accounting.accounting.cs.throttled)
-		state.flags |= PVSCHED_APPLIED_CS_THROTTLED;
-	if (runtime->accounting.accounting.generic.throttled)
-		state.flags |= PVSCHED_APPLIED_TOTAL_THROTTLED;
-	WRITE_ONCE(host->applied_state.raw, state.raw);
-	raw_spin_unlock_irqrestore(&runtime->state_lock, flags);
-}
