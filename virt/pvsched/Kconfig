@@ -14,7 +14,7 @@ config PVSCHED_POLICY_KUNIT_TEST
 	depends on KUNIT && PVSCHED
 	default KUNIT_ALL_TESTS
 	help
-	  Test host policy registration: the checks that refuse an invalid or
-	  duplicate policy, lookup by name and version, the built-in default
-	  policy listed first, and an unregistered policy that is no longer
-	  found while a reference keeps its entry alive.
+	  Test host policy registration: the checks that refuse an invalid,
+	  incomplete or duplicate policy, lookup by name and version, the
+	  built-in default policy listed first, and an unregistered policy
+	  that is no longer found while a reference keeps its entry alive.

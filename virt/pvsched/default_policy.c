@@ -4,10 +4,26 @@
 #include <linux/export.h>
 #include <linux/sched.h>
 #include <linux/sched/prio.h>
+#include <uapi/linux/sched/types.h>
 #include <kunit/visibility.h>
 #include <asm/byteorder.h>
 
 #include "default_policy.h"
+
+/* The default policy's priorities; validation keeps CS the highest. */
+static unsigned int cs_rt_prio = 60;
+static unsigned int deadline_rt_prio = 50;
+static unsigned int guest_rt_cap = 50;
+
+struct pvsched_default_policy_config pvsched_default_policy_get_config(void)
+{
+	return (struct pvsched_default_policy_config) {
+		.cs_rt_prio = cs_rt_prio,
+		.deadline_rt_prio = deadline_rt_prio,
+		.guest_rt_cap = guest_rt_cap,
+	};
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_default_policy_get_config);
 
 static bool
 pvsched_default_policy_config_valid(const struct pvsched_default_policy_config *config)
@@ -165,10 +181,135 @@ out:
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_default_policy_select);
 
+/*
+ * Charge by what the tuple is for: validation makes cs_rt_prio strictly
+ * higher than every other priority, so only CS selects it.
+ */
+static enum pvsched_boost_class
+pvsched_default_policy_class(const struct pvsched_default_policy_config *config,
+			     int baseline_nice,
+			     const struct pvsched_prio_desc *prio)
+{
+	if (prio->sched_policy == SCHED_FIFO &&
+	    prio->rt_prio == config->cs_rt_prio)
+		return PVSCHED_CLASS_CS;
+	if (pvsched_above_baseline(prio, baseline_nice))
+		return PVSCHED_CLASS_TASK;
+	return PVSCHED_CLASS_BASELINE;
+}
+
+static int pvsched_default_ops_capture(struct pvsched_policy_ctx *ctx,
+				       void *baseline)
+{
+	struct pvsched_default_params *params = baseline;
+	struct pvsched_default_priv *priv = ctx->priv;
+	struct sched_task_state state;
+
+	sched_get_task_state(ctx->task, &state);
+	if (state.policy != SCHED_NORMAL || state.reset_on_fork ||
+	    state.scx_active)
+		return -EOPNOTSUPP;
+	params->prio = (struct pvsched_prio_desc) {
+		.sched_policy = state.policy,
+		.nice = state.nice,
+		.rt_prio = state.rt_priority,
+	};
+	params->custom_slice = state.custom_slice;
+	params->slice_ns = state.slice_ns;
+	params->timer_slack_ns = state.timer_slack_ns;
+	priv->expected_nice = state.nice;
+	return 0;
+}
+
+static int pvsched_default_ops_map(struct pvsched_policy_ctx *ctx,
+				   const struct pvsched_map_input *in,
+				   void *out, enum pvsched_boost_class *class,
+				   u32 *out_flags)
+{
+	struct pvsched_default_policy_config config =
+		pvsched_default_policy_get_config();
+	const struct pvsched_default_params *baseline = ctx->baseline;
+	struct pvsched_default_params *params = out;
+	struct pvsched_default_policy_result result;
+	int ret;
+
+	ret = pvsched_default_policy_select(&config, baseline->prio.nice,
+					    in->guest, in->cs_throttled,
+					    in->generic_throttled, &result);
+	if (ret)
+		return ret;
+	*params = *baseline;
+	params->prio = result.prio;
+	*class = pvsched_default_policy_class(&config, baseline->prio.nice,
+					      &params->prio);
+	return 0;
+}
+
+static int pvsched_default_ops_apply(struct pvsched_policy_ctx *ctx,
+				     const void *data)
+{
+	const struct pvsched_default_params *params = data;
+	const struct pvsched_default_params *applied = ctx->applied;
+	struct pvsched_default_priv *priv = ctx->priv;
+	struct sched_attr attr = {
+		.size = sizeof(attr),
+		.sched_policy = params->prio.sched_policy,
+		.sched_nice = params->prio.nice,
+		.sched_priority = params->prio.rt_prio,
+	};
+	int ret;
+
+	/*
+	 * The captured slice was already clamped by __setparam_fair(); sending it
+	 * back through the setter therefore restores that exact explicit value.
+	 */
+	if (params->prio.sched_policy == SCHED_NORMAL && params->custom_slice)
+		attr.sched_runtime = params->slice_ns;
+	ret = sched_setattr_nocheck_nopi(ctx->task, &attr);
+	if (ret)
+		return ret;
+	/* Only RT policy entry clears task timer slack, so restore after FIFO. */
+	if (applied->prio.sched_policy == SCHED_FIFO &&
+	    (params->prio.sched_policy == SCHED_NORMAL ||
+	     params->prio.sched_policy == SCHED_IDLE))
+		sched_set_task_timer_slack(ctx->task, params->timer_slack_ns);
+	/* FIFO and IDLE retain the latent fair nice rather than changing it. */
+	if (params->prio.sched_policy == SCHED_NORMAL)
+		priv->expected_nice = params->prio.nice;
+	return 0;
+}
+
+static bool pvsched_default_ops_owned(struct pvsched_policy_ctx *ctx)
+{
+	const struct pvsched_default_params *baseline = ctx->baseline;
+	const struct pvsched_default_params *applied = ctx->applied;
+	const struct pvsched_default_priv *priv = ctx->priv;
+	struct sched_task_state state;
+
+	sched_get_task_state(ctx->task, &state);
+	/*
+	 * FIFO and IDLE leave fair nice latent, so compare the value last applied
+	 * under NORMAL.  A default fair slice is dynamic and is compared only when
+	 * ATTACH captured an explicit slice.  These checks make administrator
+	 * setpriority(), chrt, or slice changes establish an external owner.
+	 */
+	return state.policy == applied->prio.sched_policy &&
+	       state.nice == priv->expected_nice &&
+	       state.rt_priority == applied->prio.rt_prio &&
+	       state.custom_slice == baseline->custom_slice &&
+	       (!state.custom_slice || state.slice_ns == baseline->slice_ns) &&
+	       !state.reset_on_fork && !state.scx_active;
+}
+
 struct pvsched_policy_ops pvsched_default_policy_ops = {
 	.name = PVSCHED_DEFAULT_POLICY_NAME,
 	.version = PVSCHED_DEFAULT_POLICY_VERSION,
 	.protocol = PVSCHED_PROTOCOL_DEFAULT,
 	.params_size = sizeof(struct pvsched_default_params),
+	.priv_size = sizeof(struct pvsched_default_priv),
+	.capture_baseline = pvsched_default_ops_capture,
+	.map = pvsched_default_ops_map,
+	.apply = pvsched_default_ops_apply,
+	.owned = pvsched_default_ops_owned,
 };
 EXPORT_SYMBOL_IF_KUNIT(pvsched_default_policy_ops);

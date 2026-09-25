@@ -18,6 +18,7 @@
 /* Registered policies in registration order; the default comes first. */
 static DEFINE_MUTEX(pvsched_policy_mutex);
 static LIST_HEAD(pvsched_policies);
+static struct pvsched_policy_entry *pvsched_default_entry;
 
 bool pvsched_policy_name_valid(const char *name)
 {
@@ -69,6 +70,17 @@ struct pvsched_policy_entry *pvsched_policy_lookup(const char *name,
 	return entry;
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_policy_lookup);
+
+bool pvsched_policy_builtin(const struct pvsched_policy_ops *ops)
+{
+	return ops == &pvsched_default_policy_ops;
+}
+
+struct pvsched_policy_entry *pvsched_policy_default_entry(void)
+{
+	return pvsched_default_entry;
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_policy_default_entry);
 
 static bool pvsched_prio_desc_valid(const struct pvsched_prio_desc *prio)
 {
@@ -163,7 +175,9 @@ static bool pvsched_policy_ops_valid(const struct pvsched_policy_ops *ops)
 {
 	return pvsched_policy_name_valid(ops->name) &&
 	       ops->params_size && ops->params_size <= PVSCHED_POLICY_PARAMS_MAX &&
-	       ops->protocol == PVSCHED_PROTOCOL_DEFAULT;
+	       ops->priv_size <= PVSCHED_POLICY_PRIV_MAX &&
+	       ops->protocol == PVSCHED_PROTOCOL_DEFAULT &&
+	       ops->capture_baseline && ops->map && ops->apply;
 }
 
 int __pvsched_register_policy(struct pvsched_policy_ops *ops,
@@ -215,10 +229,18 @@ EXPORT_SYMBOL_GPL(pvsched_unregister_policy);
 
 int pvsched_policy_init(void)
 {
-	return pvsched_register_policy(&pvsched_default_policy_ops);
+	int ret;
+
+	ret = pvsched_register_policy(&pvsched_default_policy_ops);
+	if (ret)
+		return ret;
+	pvsched_default_entry = pvsched_policy_lookup(PVSCHED_DEFAULT_POLICY_NAME,
+						      PVSCHED_DEFAULT_POLICY_VERSION);
+	return 0;
 }
 
 void pvsched_policy_exit(void)
 {
 	pvsched_unregister_policy(&pvsched_default_policy_ops);
+	pvsched_policy_entry_put(pvsched_default_entry);
 }
