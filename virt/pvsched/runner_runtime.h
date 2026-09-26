@@ -195,9 +195,6 @@ int pvsched_runner_reconcile(struct pvsched_runner_runtime *runtime,
 int pvsched_runner_local_reconcile(const void *vcpu_key,
 				   enum pvsched_reconcile_event event,
 				   const struct pvsched_runner_event_input *input);
-int pvsched_runner_cleanup_reconcile(struct task_struct *task,
-				     enum pvsched_reconcile_event event,
-				     const struct pvsched_runner_event_input *input);
 
 /**
  * pvsched_runner_vmentry() - account, hand off a ticket, and publish feedback
@@ -217,9 +214,6 @@ int pvsched_runner_vmentry(struct pvsched_runner_runtime *runtime,
 int pvsched_runner_local_vmentry(const void *vcpu_key,
 				 const struct pvsched_runner_vmentry_input *input,
 				 struct pvsched_host_area *host);
-int pvsched_runner_cleanup_vmentry(struct task_struct *task,
-				   const struct pvsched_runner_vmentry_input *input,
-				   struct pvsched_host_area *host);
 
 /**
  * pvsched_runner_guest_exit_irqoff() - cancel the current GUEST cutoff timer

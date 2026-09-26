@@ -24,6 +24,7 @@
 #include <kunit/visibility.h>
 
 #include "attachment.h"
+#include "lifecycle.h"
 
 #define PVSCHED_ATTACHMENT_HASH_BITS 8
 
@@ -204,7 +205,7 @@ bool pvsched_attachment_local_visit(const void *vcpu_key,
 			/* A setter-safe cleanup checkpoint must restore the baseline. */
 			pvsched_attachment_disable_locked(attachment);
 			attachment->binding_failed = true;
-			attachment->restore_owed = true;
+			pvsched_runner_request_cleanup_locked(attachment);
 			if (visit)
 				visit(attachment,
 				      PVSCHED_ATTACHMENT_VISIT_BINDING_FAILED, data);
@@ -220,7 +221,8 @@ bool pvsched_attachment_local_visit(const void *vcpu_key,
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_attachment_local_visit);
 
-bool pvsched_attachment_mark_exited(struct task_struct *task)
+bool pvsched_attachment_mark_exited(struct task_struct *task,
+				    pvsched_attachment_visit_fn visit, void *data)
 {
 	struct pvsched_attachment *attachment;
 	unsigned long flags;
@@ -234,6 +236,9 @@ bool pvsched_attachment_mark_exited(struct task_struct *task)
 		raw_spin_lock_irqsave(&attachment->state_lock, flags);
 		attachment->exited = true;
 		pvsched_attachment_disable_locked(attachment);
+		pvsched_runner_request_cleanup_locked(attachment);
+		if (visit)
+			visit(attachment, PVSCHED_ATTACHMENT_VISIT_CLEANUP, data);
 		raw_spin_unlock_irqrestore(&attachment->state_lock, flags);
 		found = true;
 	}
@@ -241,30 +246,6 @@ bool pvsched_attachment_mark_exited(struct task_struct *task)
 	return found;
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_attachment_mark_exited);
-
-bool pvsched_attachment_cleanup_visit(struct task_struct *task,
-				      pvsched_attachment_visit_fn visit,
-				      void *data)
-{
-	struct pvsched_attachment *attachment;
-	unsigned long flags;
-	bool found = false;
-
-	rcu_read_lock();
-	hash_for_each_possible_rcu(pvsched_task_hash, attachment, task_node,
-				   (unsigned long)task) {
-		if (attachment->task != task)
-			continue;
-		raw_spin_lock_irqsave(&attachment->state_lock, flags);
-		if (visit)
-			visit(attachment, PVSCHED_ATTACHMENT_VISIT_CLEANUP, data);
-		found = true;
-		raw_spin_unlock_irqrestore(&attachment->state_lock, flags);
-	}
-	rcu_read_unlock();
-	return found;
-}
-EXPORT_SYMBOL_IF_KUNIT(pvsched_attachment_cleanup_visit);
 
 unsigned int pvsched_attachment_remote_visit(const void *vcpu_key,
 					     u32 target_mode_flags,
