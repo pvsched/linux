@@ -23,6 +23,9 @@ pvsched-attachment-test-y := attachment_test.o
 obj-$(CONFIG_PVSCHED_LIFECYCLE_KUNIT_TEST) += pvsched-lifecycle-test.o
 pvsched-lifecycle-test-y := lifecycle_test.o
 
+obj-$(CONFIG_PVSCHED_EVENT_SERVICE_KUNIT_TEST) += pvsched-event-service-test.o
+pvsched-event-service-test-y := event_service_test.o
+
 obj-$(CONFIG_PVSCHED_SHM_KUNIT_TEST) += pvsched-shm-test.o
 pvsched-shm-test-y := shm_test.o
 

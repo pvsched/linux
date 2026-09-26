@@ -10,6 +10,17 @@ config PVSCHED
 	  interrupt-wake boundaries, but pvsched does not attach shared pages
 	  or change task scheduling.
 
+config PVSCHED_EVENT_SERVICE_KUNIT_TEST
+	tristate "KUnit tests for the pvsched production event service" if !KUNIT_ALL_TESTS
+	depends on KUNIT && PVSCHED && KVM && X86_64
+	default KUNIT_ALL_TESTS
+	help
+	  Test complete first/last probe registration and real task-exit
+	  notification through the pvsched event service: one
+	  holder count covers every KVM hook and the exit tracepoint, and
+	  concurrent first and last holders register and unregister the
+	  set exactly once.
+
 config PVSCHED_SHM_KUNIT_TEST
 	tristate "KUnit tests for pvsched shared-memory ownership" if !KUNIT_ALL_TESTS
 	depends on KUNIT && PVSCHED && SHMEM

@@ -10,6 +10,7 @@
 #include <linux/sched/signal.h>
 #include <linux/sched/task.h>
 
+#include "event_service.h"
 #include "internal.h"
 #include "lifecycle.h"
 
@@ -22,6 +23,9 @@ struct pvsched_lifecycle_test_ctx {
 struct pvsched_lifecycle_test_state {
 	u32 drain_calls;
 	u32 owner_snapshots;
+	/* A local event run from inside publication, and its result. */
+	int visit_key;
+	int visit_ret;
 	bool fail_setter;
 	struct pvsched_vcpu_runner *checkpoint_runner;
 	enum pvsched_lifecycle_test_point checkpoint;
@@ -81,6 +85,24 @@ static void pvsched_lifecycle_test_owner_exit(struct task_struct *task,
 	*mm = task->mm;
 	*tgid = task_tgid(task);
 	*exiting = true;
+}
+
+/* Run a local event after task-hash insertion, before admission opens. */
+static void pvsched_lifecycle_test_owner_visit(struct task_struct *task,
+					       struct mm_struct **mm,
+					       struct pid **tgid,
+					       bool *exiting)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct pvsched_lifecycle_test_state *state = test->priv;
+
+	state->visit_ret = pvsched_runner_local_event(&state->visit_key,
+		PVSCHED_RECONCILE_CANCEL, 0, false, false);
+	task_lock(task);
+	*mm = task->mm;
+	*tgid = task_tgid(task);
+	*exiting = false;
+	task_unlock(task);
 }
 
 static int pvsched_lifecycle_test_setattr(struct task_struct *task,
@@ -332,6 +354,7 @@ static void pvsched_lifecycle_final_close_one_drain_test(struct kunit *test)
 	struct pvsched_lifecycle_test_ctx *ctx = pvsched_lifecycle_setup(test);
 	struct pvsched_vcpu_runner second = { };
 	struct task_struct *task;
+	unsigned int holders;
 	int ret;
 
 	if (!ctx)
@@ -352,11 +375,15 @@ static void pvsched_lifecycle_final_close_one_drain_test(struct kunit *test)
 	}
 	kunit_activate_static_stub(test, pvsched_attachment_drain,
 				   pvsched_lifecycle_test_drain);
+	holders = pvsched_event_service_holders();
+	KUNIT_EXPECT_GE(test, holders, 2U);
 	ctx->session.closing = true;
 	pvsched_session_release_runtimes(&ctx->session);
 	KUNIT_EXPECT_PTR_EQ(test, ctx->runner.runtime, NULL);
 	KUNIT_EXPECT_PTR_EQ(test, second.runtime, NULL);
 	KUNIT_EXPECT_EQ(test, state->drain_calls, 1U);
+	/* Final close gave back both runtimes' references. */
+	KUNIT_EXPECT_EQ(test, pvsched_event_service_holders(), holders - 2);
 	list_del(&second.session_node);
 	cancel_work_sync(&second.cleanup_work);
 	put_pid(second.pid);
@@ -370,6 +397,7 @@ static void pvsched_lifecycle_publish_exit_stale_work_test(struct kunit *test)
 	struct pvsched_session session = { };
 	struct pvsched_vcpu_runner runner = { };
 	struct pvsched_runner_runtime runtime;
+	unsigned int holders = pvsched_event_service_holders();
 	int ret;
 
 	mutex_init(&session.lock);
@@ -393,9 +421,93 @@ static void pvsched_lifecycle_publish_exit_stale_work_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ret, -ESRCH);
 	KUNIT_EXPECT_PTR_EQ(test, runner.runtime, NULL);
 	KUNIT_EXPECT_EQ(test, state->drain_calls, 1U);
+	/* The failed publication gave its event-service reference back. */
+	KUNIT_EXPECT_EQ(test, pvsched_event_service_holders(), holders);
 	pvsched_runner_runtime_release(&runtime);
 	flush_work(&runner.cleanup_work);
 	KUNIT_EXPECT_PTR_EQ(test, runner.runtime, NULL);
+	list_del(&runner.session_node);
+	put_pid(runner.pid);
+}
+
+/*
+ * A local event that finds the task hashed but not yet admitted must not
+ * request teardown: publication completes and the runner stays served.
+ */
+static void pvsched_lifecycle_publish_insert_visit_test(struct kunit *test)
+{
+	struct pvsched_lifecycle_test_state *state = test->priv;
+	struct pvsched_default_policy_config config = pvsched_lifecycle_config();
+	struct pvsched_session session = { };
+	struct pvsched_vcpu_runner runner = { };
+	struct pvsched_runner_runtime *runtime;
+	unsigned int holders = pvsched_event_service_holders();
+	int ret;
+
+	mutex_init(&session.lock);
+	INIT_LIST_HEAD(&session.runners);
+	runner.pid = get_task_pid(current, PIDTYPE_PID);
+	pvsched_runner_lifecycle_init(&runner, &session);
+	list_add(&runner.session_node, &session.runners);
+	runtime = kzalloc_obj(*runtime);
+	KUNIT_ASSERT_NOT_NULL(test, runtime);
+	ret = pvsched_runner_runtime_prepare(runtime, current, &config,
+					     NSEC_PER_SEC, NSEC_PER_SEC,
+					     &runner.ticket_owner, true);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	kunit_activate_static_stub(test, pvsched_attachment_owner_snapshot,
+				   pvsched_lifecycle_test_owner_visit);
+	runtime->attachment.shm.addr = &pvsched_lifecycle_page;
+	mutex_lock(&session.lock);
+	ret = pvsched_runner_publish_runtime_locked(&runner, runtime, NULL,
+						    NULL);
+	mutex_unlock(&session.lock);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, state->visit_ret, -ESHUTDOWN);
+	flush_work(&runner.cleanup_work);
+	KUNIT_EXPECT_PTR_EQ(test, runner.runtime, runtime);
+	KUNIT_EXPECT_TRUE(test, runtime->attachment.active);
+	KUNIT_EXPECT_EQ(test, pvsched_event_service_holders(), holders + 1);
+
+	mutex_lock(&session.lock);
+	pvsched_runner_detach_runtime_locked(&runner);
+	mutex_unlock(&session.lock);
+	/* Detach gave back the reference that publication took. */
+	KUNIT_EXPECT_EQ(test, pvsched_event_service_holders(), holders);
+	cancel_work_sync(&runner.cleanup_work);
+	list_del(&runner.session_node);
+	put_pid(runner.pid);
+}
+
+static void pvsched_lifecycle_publish_without_page_test(struct kunit *test)
+{
+	struct pvsched_default_policy_config config = pvsched_lifecycle_config();
+	unsigned int holders = pvsched_event_service_holders();
+	struct pvsched_session session = { };
+	struct pvsched_vcpu_runner runner = { };
+	struct pvsched_runner_runtime runtime;
+	int ret;
+
+	mutex_init(&session.lock);
+	INIT_LIST_HEAD(&session.runners);
+	runner.pid = get_task_pid(current, PIDTYPE_PID);
+	pvsched_runner_lifecycle_init(&runner, &session);
+	list_add(&runner.session_node, &session.runners);
+	ret = pvsched_runner_runtime_prepare(&runtime, current, &config,
+					     NSEC_PER_SEC, NSEC_PER_SEC,
+					     &runner.ticket_owner, true);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	/* Expected WARN: the probes would read a page that is not mapped. */
+	mutex_lock(&session.lock);
+	ret = pvsched_runner_publish_runtime_locked(&runner, &runtime, NULL,
+						    NULL);
+	mutex_unlock(&session.lock);
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+	KUNIT_EXPECT_PTR_EQ(test, runner.runtime, NULL);
+	KUNIT_EXPECT_FALSE(test, runtime.attachment.task_hashed);
+	KUNIT_EXPECT_FALSE(test, runtime.attachment.vcpu_hashed);
+	KUNIT_EXPECT_EQ(test, pvsched_event_service_holders(), holders);
+	pvsched_runner_runtime_release(&runtime);
 	list_del(&runner.session_node);
 	put_pid(runner.pid);
 }
@@ -793,6 +905,8 @@ static struct kunit_case pvsched_lifecycle_test_cases[] = {
 	KUNIT_CASE(pvsched_lifecycle_external_owner_work_test),
 	KUNIT_CASE(pvsched_lifecycle_final_close_one_drain_test),
 	KUNIT_CASE(pvsched_lifecycle_publish_exit_stale_work_test),
+	KUNIT_CASE(pvsched_lifecycle_publish_insert_visit_test),
+	KUNIT_CASE(pvsched_lifecycle_publish_without_page_test),
 	KUNIT_CASE(pvsched_lifecycle_duplicate_zero_drain_test),
 	KUNIT_CASE(pvsched_lifecycle_query_converges_exit_test),
 	KUNIT_CASE(pvsched_lifecycle_target_state_test),
