@@ -2,7 +2,7 @@
 
 obj-$(CONFIG_PVSCHED) += pvsched.o
 pvsched-y := core.o shm.o shm_bridge.o attachment.o lifecycle.o accounting.o runtime_accounting.o \
-	    policy.o default_policy.o runner_runtime.o
+	    policy.o default_policy.o runner_runtime.o event_service.o
 
 obj-$(CONFIG_PVSCHED_ACCOUNTING_KUNIT_TEST) += pvsched-accounting-test.o
 pvsched-accounting-test-y := accounting_test.o

@@ -255,6 +255,18 @@ vCPU that the host has descheduled may execute no KVM producer callback, so no
 fact can accelerate that initial host runqueue wait.  Target-side eligibility
 is still reported when the vCPU is selected and prepares to enter.
 
+pvsched keeps an attachment whose vCPU runs with SVM AVIC or SVM virtual NMI
+configured, but gives it no interrupt ticket: those deliveries bypass the
+software injection the ticket follows.  Its interrupts and NMIs rely on the
+guest critical-section signal, as a posted interrupt to a running VMX guest
+does.  Published intent, the halt boost, the idle hold and the budgets still
+apply.  Only interrupts that KVM accepts in software raise the injection
+boost: with AVIC, an IPI to a vCPU that is not running only kicks it, so like
+a posted interrupt it cannot shorten that vCPU's host runqueue wait.  Virtual
+NMI suppresses the ticket for ordinary interrupts as well.  Protected
+execution and VMX software-assisted real mode revoke the attachment; pvsched
+restores the baseline and logs a rate-limited warning.
+
 VMX software-assisted real mode reports the mode bit but does not report an
 IRQ/NMI handoff opportunity.  Real mode with unrestricted guest remains in the
 ordinary supported VMX path.  The software-assisted case is deferred because

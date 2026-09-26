@@ -127,6 +127,11 @@ bool pvsched_attachment_local_visit(const void *vcpu_key,
 				    pvsched_attachment_visit_fn visit,
 				    void *data);
 
+/* IRQ-off VMEXIT lookup that never changes binding, position, or mode. */
+bool pvsched_attachment_local_irqoff_visit(const void *vcpu_key,
+					   pvsched_attachment_visit_fn visit,
+					   void *data);
+
 /* Exit latches independently of ordinary owner-mm/TGID admission. */
 bool pvsched_attachment_mark_exited(struct task_struct *task,
 				    pvsched_attachment_visit_fn visit, void *data);
