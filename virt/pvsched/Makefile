@@ -20,5 +20,8 @@ pvsched-runner-runtime-test-y := runner_runtime_test.o
 obj-$(CONFIG_PVSCHED_ATTACHMENT_KUNIT_TEST) += pvsched-attachment-test.o
 pvsched-attachment-test-y := attachment_test.o
 
+obj-$(CONFIG_PVSCHED_LIFECYCLE_KUNIT_TEST) += pvsched-lifecycle-test.o
+pvsched-lifecycle-test-y := lifecycle_test.o
+
 obj-$(CONFIG_PVSCHED_POLICY_KUNIT_TEST) += pvsched-policy-test.o
 pvsched-policy-test-y := policy_test.o
