@@ -221,6 +221,37 @@ bool pvsched_attachment_local_visit(const void *vcpu_key,
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_attachment_local_visit);
 
+bool pvsched_attachment_local_irqoff_visit(const void *vcpu_key,
+					   pvsched_attachment_visit_fn visit,
+					   void *data)
+{
+	struct pvsched_attachment *attachment;
+	unsigned long flags;
+	bool found = false;
+
+	if (!vcpu_key)
+		return false;
+	rcu_read_lock();
+	hash_for_each_possible_rcu(pvsched_task_hash, attachment, task_node,
+				   (unsigned long)current) {
+		if (attachment->task != current)
+			continue;
+		raw_spin_lock_irqsave(&attachment->state_lock, flags);
+		if (attachment->active && attachment->vcpu.key == vcpu_key &&
+		    attachment->vcpu_hashed) {
+			if (visit)
+				visit(attachment,
+				      PVSCHED_ATTACHMENT_VISIT_ORDINARY, data);
+			found = true;
+		}
+		raw_spin_unlock_irqrestore(&attachment->state_lock, flags);
+		break;
+	}
+	rcu_read_unlock();
+	return found;
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_attachment_local_irqoff_visit);
+
 bool pvsched_attachment_mark_exited(struct task_struct *task,
 				    pvsched_attachment_visit_fn visit, void *data)
 {

@@ -6,6 +6,7 @@
 #include <kunit/visibility.h>
 
 #include "internal.h"
+#include "event_service.h"
 #include "lifecycle.h"
 
 static bool pvsched_baseline_equal(const struct sched_task_state *a,
@@ -79,11 +80,15 @@ pvsched_runner_close_locked(struct pvsched_vcpu_runner *runner, bool final)
 	return true;
 }
 
-/* Free a closed, unhashed and drained runtime. */
+/*
+ * Free a closed, unhashed and drained runtime.  Only a published runtime is
+ * ever installed in runner->runtime, and publishing took the event service.
+ */
 static void pvsched_runner_free_runtime_locked(struct pvsched_vcpu_runner *runner)
 {
 	struct pvsched_runner_runtime *runtime = runner->runtime;
 
+	pvsched_event_service_put();
 	pvsched_runner_runtime_release(runtime);
 	kfree(runtime);
 	runner->runtime = NULL;
@@ -144,9 +149,14 @@ int pvsched_runner_publish_runtime_locked(struct pvsched_vcpu_runner *runner,
 	runtime->attachment.runner = runner;
 	if (runner->last_fault_valid)
 		runtime->last_fault = runner->last_fault;
-	ret = pvsched_runner_runtime_publish(runtime, commit, data);
+	ret = pvsched_event_service_get();
 	if (ret)
 		return ret;
+	ret = pvsched_runner_runtime_publish(runtime, commit, data);
+	if (ret) {
+		pvsched_event_service_put();
+		return ret;
+	}
 	if (!runner->baseline_valid) {
 		runner->baseline = runtime->baseline;
 		runner->baseline_valid = true;

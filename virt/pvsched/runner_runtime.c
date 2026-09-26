@@ -10,6 +10,7 @@
 #include <uapi/linux/sched/types.h>
 #include <kunit/visibility.h>
 #include "runner_runtime.h"
+#include "shm_bridge.h"
 #include "lifecycle.h"
 
 static enum hrtimer_restart pvsched_cutoff_timer(struct hrtimer *timer)
@@ -388,6 +389,9 @@ EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_prepare);
 int pvsched_runner_runtime_publish(struct pvsched_runner_runtime *runtime,
 				   pvsched_attachment_commit_fn commit, void *data)
 {
+	/* Service reads and writes the shared page; it must be mapped first. */
+	if (WARN_ON_ONCE(!runtime->attachment.shm.addr))
+		return -EINVAL;
 	return pvsched_attachment_publish(&runtime->attachment, commit, data);
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_publish);
@@ -831,7 +835,7 @@ pvsched_publish_applied_locked(const struct pvsched_runner_runtime *runtime,
 static int
 pvsched_runner_vmentry_locked(struct pvsched_runner_runtime *runtime,
 			      const struct pvsched_runner_vmentry_input *input,
-			      struct pvsched_host_area *host)
+			      struct pvsched_host_area *host, bool *published)
 {
 	struct pvsched_runtime_sample sample;
 	bool had_host_reason, nested;
@@ -878,6 +882,7 @@ pvsched_runner_vmentry_locked(struct pvsched_runner_runtime *runtime,
 			hrtimer_start(&runtime->cutoff_timer, ns_to_ktime(0),
 				      HRTIMER_MODE_REL_PINNED_HARD);
 			pvsched_publish_applied_locked(runtime, host, false);
+			*published = true;
 			ret = 0;
 			goto unlock;
 		}
@@ -914,6 +919,7 @@ pvsched_runner_vmentry_locked(struct pvsched_runner_runtime *runtime,
 		}
 		if (!nested) {
 			pvsched_publish_applied_locked(runtime, host, true);
+			*published = true;
 		}
 	}
 unlock:
@@ -925,69 +931,15 @@ int pvsched_runner_vmentry(struct pvsched_runner_runtime *runtime,
 			   struct pvsched_host_area *host)
 {
 	unsigned long flags;
+	bool published = false;
 	int ret;
 
 	raw_spin_lock_irqsave(&runtime->attachment.state_lock, flags);
-	ret = pvsched_runner_vmentry_locked(runtime, input, host);
+	ret = pvsched_runner_vmentry_locked(runtime, input, host, &published);
 	raw_spin_unlock_irqrestore(&runtime->attachment.state_lock, flags);
 	return ret;
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_vmentry);
-
-struct pvsched_runner_local_reconcile_ctx {
-	enum pvsched_reconcile_event event;
-	const struct pvsched_runner_event_input *input;
-	int ret;
-};
-
-static void
-pvsched_runner_local_reconcile_visit(struct pvsched_attachment *attachment,
-				     enum pvsched_attachment_visit_kind kind,
-				     void *data)
-{
-	struct pvsched_runner_local_reconcile_ctx *ctx = data;
-	struct pvsched_runner_runtime *runtime =
-		container_of(attachment, struct pvsched_runner_runtime, attachment);
-
-	/* A failed binding is reported, not recorded as the runner's fault. */
-	if (kind == PVSCHED_ATTACHMENT_VISIT_BINDING_FAILED)
-		runtime->restore_owed_error = -ESTALE;
-	ctx->ret = pvsched_runner_reconcile_locked(runtime, ctx->event,
-						   ctx->input);
-}
-
-int pvsched_runner_local_reconcile(const void *vcpu_key,
-				   enum pvsched_reconcile_event event,
-				   const struct pvsched_runner_event_input *input)
-{
-	struct pvsched_runner_local_reconcile_ctx ctx = {
-		.event = event,
-		.input = input,
-		.ret = -ENOENT,
-	};
-	enum pvsched_runner_position position;
-
-	/* INJECT is exclusively vCPU-keyed and must not mutate local facts. */
-	if (event == PVSCHED_RECONCILE_INJECT)
-		return -EINVAL;
-
-	switch (event) {
-	case PVSCHED_RECONCILE_HALT:
-		position = PVSCHED_RUNNER_BLOCKED;
-		break;
-	case PVSCHED_RECONCILE_RUN_LEAVE:
-		position = PVSCHED_RUNNER_QEMU;
-		break;
-	default:
-		position = PVSCHED_RUNNER_HOST;
-		break;
-	}
-	pvsched_attachment_local_visit(vcpu_key, position,
-		input ? input->mode_flags : 0,
-		pvsched_runner_local_reconcile_visit, &ctx);
-	return ctx.ret;
-}
-EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_local_reconcile);
 
 struct pvsched_runner_remote_inject_ctx {
 	u32 mode_flags;
@@ -1067,42 +1019,130 @@ unlock:
 	raw_spin_unlock_irqrestore(&runtime->attachment.state_lock, flags);
 }
 
-struct pvsched_runner_local_vmentry_ctx {
-	const struct pvsched_runner_vmentry_input *input;
-	struct pvsched_host_area *host;
+struct pvsched_runner_local_event_ctx {
+	enum pvsched_reconcile_event event;
+	u32 mode_flags;
+	bool vmentry;
+	bool interrupt_ready;
 	int ret;
 };
 
 static void
-pvsched_runner_local_vmentry_visit(struct pvsched_attachment *attachment,
-				   enum pvsched_attachment_visit_kind kind,
-				   void *data)
+pvsched_runner_local_event_visit(struct pvsched_attachment *attachment,
+				 enum pvsched_attachment_visit_kind kind,
+				 void *data)
 {
-	struct pvsched_runner_local_vmentry_ctx *ctx = data;
+	struct pvsched_runner_local_event_ctx *ctx = data;
 	struct pvsched_runner_runtime *runtime =
 		container_of(attachment, struct pvsched_runner_runtime, attachment);
+	/* Only the bridge touches the page; the runtime sees local copies. */
+	const struct pvsched_shm *shm = &attachment->shm;
+	struct pvsched_default_guest_area guest;
+	struct pvsched_runner_event_input input;
+	struct pvsched_runner_vmentry_input entry;
+	struct pvsched_host_area staged = { };
+	bool published = false;
 
 	/* A failed binding is reported, not recorded as the runner's fault. */
 	if (kind == PVSCHED_ATTACHMENT_VISIT_BINDING_FAILED)
 		runtime->restore_owed_error = -ESTALE;
-	ctx->ret = pvsched_runner_vmentry_locked(runtime, ctx->input, ctx->host);
+	/* Cleanup visits never read or write the page. */
+	if (kind != PVSCHED_ATTACHMENT_VISIT_ORDINARY) {
+		if (ctx->vmentry) {
+			entry = (struct pvsched_runner_vmentry_input) {
+				.mode_flags = ctx->mode_flags,
+				.interrupt_ready = ctx->interrupt_ready,
+			};
+			ctx->ret = pvsched_runner_vmentry_locked(runtime, &entry,
+						      &staged, &published);
+		} else {
+			ctx->ret = pvsched_runner_reconcile_locked(runtime,
+							    ctx->event, NULL);
+		}
+		return;
+	}
+	if (ctx->event == PVSCHED_RECONCILE_RUN_LEAVE) {
+		input = (struct pvsched_runner_event_input) {
+			.mode_flags = ctx->mode_flags,
+		};
+		ctx->ret = pvsched_runner_reconcile_locked(runtime, ctx->event,
+						    &input);
+		return;
+	}
+	if (ctx->event == PVSCHED_RECONCILE_INJECT) {
+		ctx->ret = -EINVAL;
+		return;
+	}
+	/* Nested L2 must not read the guest page; the runtime keeps L1's. */
+	if (ctx->mode_flags & PVSCHED_RUNNER_MODE_NESTED)
+		memset(&guest, 0, sizeof(guest));
+	else
+		pvsched_shm_bridge_snapshot(shm, &guest);
+	if (ctx->vmentry) {
+		entry = (struct pvsched_runner_vmentry_input) {
+			.guest = guest,
+			.mode_flags = ctx->mode_flags,
+			.interrupt_ready = ctx->interrupt_ready,
+		};
+		ctx->ret = pvsched_runner_vmentry_locked(runtime, &entry,
+						      &staged, &published);
+		if (published)
+			pvsched_shm_bridge_publish_vmentry(shm, &staged);
+		return;
+	}
+	input = (struct pvsched_runner_event_input) {
+		.guest = &guest,
+		.mode_flags = ctx->mode_flags,
+	};
+	ctx->ret = pvsched_runner_reconcile_locked(runtime, ctx->event, &input);
 }
 
-int pvsched_runner_local_vmentry(const void *vcpu_key,
-				 const struct pvsched_runner_vmentry_input *input,
-				 struct pvsched_host_area *host)
+int pvsched_runner_local_event(const void *vcpu_key,
+			       enum pvsched_reconcile_event event,
+			       u32 mode_flags, bool vmentry,
+			       bool interrupt_ready)
 {
-	struct pvsched_runner_local_vmentry_ctx ctx = {
-		.input = input,
-		.host = host,
+	struct pvsched_runner_local_event_ctx ctx = {
+		.event = event,
+		.mode_flags = mode_flags,
+		.vmentry = vmentry,
+		.interrupt_ready = interrupt_ready,
 		.ret = -ENOENT,
 	};
+	enum pvsched_runner_position position;
 
-	pvsched_attachment_local_visit(vcpu_key, PVSCHED_RUNNER_GUEST,
-		input->mode_flags, pvsched_runner_local_vmentry_visit, &ctx);
+	if (event == PVSCHED_RECONCILE_INJECT)
+		return -EINVAL;
+	if (vmentry)
+		position = PVSCHED_RUNNER_GUEST;
+	else if (event == PVSCHED_RECONCILE_HALT)
+		position = PVSCHED_RUNNER_BLOCKED;
+	else if (event == PVSCHED_RECONCILE_RUN_LEAVE)
+		position = PVSCHED_RUNNER_QEMU;
+	else
+		position = PVSCHED_RUNNER_HOST;
+	pvsched_attachment_local_visit(vcpu_key, position, mode_flags,
+				       pvsched_runner_local_event_visit, &ctx);
 	return ctx.ret;
 }
-EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_local_vmentry);
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_local_event);
+
+static void
+pvsched_runner_guest_exit_irqoff_visit(struct pvsched_attachment *attachment,
+					enum pvsched_attachment_visit_kind kind,
+					void *data)
+{
+	struct pvsched_runner_runtime *runtime =
+		container_of(attachment, struct pvsched_runner_runtime, attachment);
+
+	pvsched_runner_guest_exit_irqoff(runtime);
+}
+
+void pvsched_runner_local_guest_exit_irqoff(const void *vcpu_key)
+{
+	pvsched_attachment_local_irqoff_visit(vcpu_key,
+				pvsched_runner_guest_exit_irqoff_visit, NULL);
+}
 
 void pvsched_runner_guest_exit_irqoff(struct pvsched_runner_runtime *runtime)
 {
