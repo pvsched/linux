@@ -14,6 +14,7 @@
 enum pvsched_runner_test_command {
 	PVSCHED_TEST_COMMAND_NONE,
 	PVSCHED_TEST_COMMAND_EVENT,
+	PVSCHED_TEST_COMMAND_SPIN,
 	PVSCHED_TEST_COMMAND_STOP,
 };
 
@@ -21,6 +22,8 @@ struct pvsched_runner_test_ctx {
 	struct completion ready;
 	struct completion command_ready;
 	struct completion command_done;
+	struct completion spin_started;
+	struct completion spin_release;
 	struct task_struct *task;
 	struct pvsched_runner_runtime runtime;
 	/* The shared page a published runtime serves from. */
@@ -254,10 +257,31 @@ static int pvsched_runner_test_thread(void *data)
 				ctx->command_key, ctx->command_event,
 				ctx->command_mode_flags, ctx->command_is_vmentry,
 				ctx->command_interrupt_ready);
+		else if (ctx->command == PVSCHED_TEST_COMMAND_SPIN) {
+			complete(&ctx->spin_started);
+			while (!completion_done(&ctx->spin_release))
+				cpu_relax();
+		}
 		ctx->command = PVSCHED_TEST_COMMAND_NONE;
 		complete(&ctx->command_done);
 	}
 	return 0;
+}
+
+static void pvsched_runner_test_start_spin(struct pvsched_runner_test_ctx *ctx)
+{
+	reinit_completion(&ctx->command_done);
+	reinit_completion(&ctx->spin_started);
+	reinit_completion(&ctx->spin_release);
+	ctx->command = PVSCHED_TEST_COMMAND_SPIN;
+	complete(&ctx->command_ready);
+	wait_for_completion(&ctx->spin_started);
+}
+
+static void pvsched_runner_test_stop_spin(struct pvsched_runner_test_ctx *ctx)
+{
+	complete(&ctx->spin_release);
+	wait_for_completion(&ctx->command_done);
 }
 
 static int pvsched_runner_test_local_event(
@@ -354,6 +378,8 @@ pvsched_runner_test_setup_policy(struct kunit *test,
 	init_completion(&ctx->ready);
 	init_completion(&ctx->command_ready);
 	init_completion(&ctx->command_done);
+	init_completion(&ctx->spin_started);
+	init_completion(&ctx->spin_release);
 	ctx->task = kthread_run(pvsched_runner_test_thread, ctx,
 				"pvsched-runner-test");
 	if (IS_ERR(ctx->task)) {
@@ -1277,6 +1303,132 @@ static void pvsched_runner_local_inject_refused_without_mutation_test(struct kun
 	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters);
 }
 
+static void pvsched_runner_guest_source_inject_uses_hard_work_test(struct kunit *test)
+{
+	struct pvsched_runner_test_ctx *ctx;
+	unsigned int visited;
+	int key;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_local_event(ctx, &key,
+		PVSCHED_RECONCILE_RUN_ENTER, 0, false, false), 0);
+	KUNIT_EXPECT_TRUE(test, irq_work_is_hard(&ctx->runtime.inject_work));
+	pvsched_runner_test_start_spin(ctx);
+	visited = pvsched_runner_remote_inject(&key, 0, true);
+	irq_work_sync(&ctx->runtime.inject_work);
+	pvsched_runner_test_stop_spin(ctx);
+	KUNIT_EXPECT_EQ(test, visited, 1U);
+	KUNIT_EXPECT_TRUE(test, ctx->runtime.reasons &
+			  PVSCHED_RUNNER_REASON_INJECT);
+}
+
+static void pvsched_runner_vmentry_publishes_to_page_test(struct kunit *test)
+{
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	union pvsched_applied_state applied;
+	struct pvsched_runner_test_ctx *ctx;
+	int key;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	guest.cs_state = cpu_to_le64(PVSCHED_CS_NMI);
+	ctx->page->guest_area.default_area = guest;
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_local_event(ctx, &key,
+		PVSCHED_RECONCILE_RUN_ENTER, 0, false, false), 0);
+	pvsched_runner_expect_state(test, ctx->task, SCHED_FIFO, 5, 60);
+
+	/* An admitted VMENTRY publishes the applied boost on the page. */
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_local_event(ctx, &key,
+		PVSCHED_RECONCILE_CANCEL, 0, true, false), 0);
+	applied.raw = READ_ONCE(ctx->page->host_area.applied_state.raw);
+	KUNIT_EXPECT_EQ(test, applied.boost, PVSCHED_BOOST_CS);
+
+	/* A closed attachment's VMENTRY is a cleanup visit and publishes nothing. */
+	ctx->page->host_area.applied_state.raw = cpu_to_le64(0x5a5a);
+	pvsched_attachment_disable(&ctx->runtime.attachment);
+	KUNIT_EXPECT_NE(test, pvsched_runner_test_local_event(ctx, &key,
+		PVSCHED_RECONCILE_CANCEL, 0, true, false), 0);
+	KUNIT_EXPECT_EQ(test, ctx->page->host_area.applied_state.raw,
+			cpu_to_le64(0x5a5a));
+}
+
+static void pvsched_runner_nested_event_uses_retained_snapshot_test(struct kunit *test)
+{
+	struct pvsched_runner_test_ctx *ctx;
+	int key;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_local_event(ctx, &key,
+		PVSCHED_RECONCILE_RUN_ENTER, 0, false, false), 0);
+	/* Selection would reject this page if a nested event read it. */
+	ctx->page->guest_area.default_area.cs_state =
+		cpu_to_le64(PVSCHED_CS_RESERVED_MASK & (1ULL << 40));
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_local_event(ctx, &key,
+		PVSCHED_RECONCILE_CANCEL, PVSCHED_RUNNER_MODE_NESTED,
+		false, false), 0);
+	/* The same page is read, and rejected, outside nested mode. */
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_local_event(ctx, &key,
+		PVSCHED_RECONCILE_CANCEL, 0, false, false), -EINVAL);
+}
+
+static void pvsched_runner_nested_vmentry_skips_page_test(struct kunit *test)
+{
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	union pvsched_applied_state applied;
+	struct pvsched_runner_test_ctx *ctx;
+	int key;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	guest.cs_state = cpu_to_le64(PVSCHED_CS_NMI);
+	ctx->page->guest_area.default_area = guest;
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_local_event(ctx, &key,
+		PVSCHED_RECONCILE_RUN_ENTER, 0, false, false), 0);
+	pvsched_runner_expect_state(test, ctx->task, SCHED_FIFO, 5, 60);
+	/*
+	 * A supported nested entry neither reads nor writes the page: take the
+	 * mapping away, so any access would fault.
+	 */
+	ctx->runtime.attachment.shm.addr = NULL;
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_local_event(ctx, &key,
+		PVSCHED_RECONCILE_CANCEL, PVSCHED_RUNNER_MODE_NESTED,
+		true, false), 0);
+	ctx->runtime.attachment.shm.addr = ctx->page;
+	pvsched_runner_expect_state(test, ctx->task, SCHED_FIFO, 5, 60);
+
+	/* Back in L1, the page is read and published to again. */
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_local_event(ctx, &key,
+		PVSCHED_RECONCILE_CANCEL, 0, true, false), 0);
+	applied.raw = READ_ONCE(ctx->page->host_area.applied_state.raw);
+	KUNIT_EXPECT_EQ(test, applied.boost, PVSCHED_BOOST_CS);
+}
+
+static void pvsched_runner_cleanup_visit_skips_snapshot_test(struct kunit *test)
+{
+	struct pvsched_runner_test_ctx *ctx;
+	int key;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_local_event(ctx, &key,
+		PVSCHED_RECONCILE_RUN_ENTER, 0, false, false), 0);
+	pvsched_attachment_disable(&ctx->runtime.attachment);
+	/* A cleanup visit must not touch the page: take the mapping away. */
+	ctx->runtime.attachment.shm.addr = NULL;
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_local_event(ctx, &key,
+		PVSCHED_RECONCILE_VMEXIT, 0, false, false), -ESHUTDOWN);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_local_event(ctx, &key,
+		PVSCHED_RECONCILE_CANCEL, 0, true, false), -ESHUTDOWN);
+	ctx->runtime.attachment.shm.addr = ctx->page;
+}
+
 static void pvsched_runner_blocked_inject_is_record_only_test(struct kunit *test)
 {
 	struct pvsched_runner_event_input inject = { };
@@ -1750,6 +1902,65 @@ static void pvsched_runner_binding_mismatch_vmentry_defers_test(struct kunit *te
 	KUNIT_EXPECT_EQ(test, ctx->runtime.restore_owed_error, 0);
 	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters + 1);
 	pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, 5, 0);
+}
+
+static void pvsched_runner_closed_vmentry_defers_restore_test(struct kunit *test)
+{
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_runner_test_ctx *ctx;
+	u32 setters;
+	int key;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	guest.cs_state = cpu_to_le64(PVSCHED_CS_NMI);
+	ctx->page->guest_area.default_area = guest;
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_local_event(ctx, &key,
+		PVSCHED_RECONCILE_RUN_ENTER, 0, false, false), 0);
+	pvsched_runner_runtime_disable(&ctx->runtime);
+	ctx->runtime.restore_owed_error = -EIO;
+	setters = pvsched_runner_test_setter_calls(test);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_local_event(ctx, &key,
+		PVSCHED_RECONCILE_CANCEL, 0, true, false), -ESHUTDOWN);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters);
+	KUNIT_EXPECT_FALSE(test, hrtimer_active(&ctx->runtime.cutoff_timer));
+	pvsched_runner_runtime_drain_actions(&ctx->runtime);
+	KUNIT_EXPECT_EQ(test,
+		pvsched_runner_runtime_finish_close(&ctx->runtime, true), 0);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters + 1);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.restore_owed_error, 0);
+	pvsched_runner_runtime_unhash(&ctx->runtime);
+	pvsched_attachment_drain();
+	pvsched_runner_runtime_release(&ctx->runtime);
+	ctx->runtime_live = false;
+}
+
+static void pvsched_runner_disabled_vmentry_defers_restore_test(struct kunit *test)
+{
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_runner_test_ctx *ctx;
+	u32 setters;
+	int key;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	guest.cs_state = cpu_to_le64(PVSCHED_CS_NMI);
+	ctx->page->guest_area.default_area = guest;
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_local_event(ctx, &key,
+		PVSCHED_RECONCILE_RUN_ENTER, 0, false, false), 0);
+	pvsched_attachment_disable(&ctx->runtime.attachment);
+	ctx->runtime.restore_owed_error = -EIO;
+	setters = pvsched_runner_test_setter_calls(test);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_local_event(ctx, &key,
+		PVSCHED_RECONCILE_CANCEL, 0, true, false), -EIO);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters);
+	KUNIT_EXPECT_TRUE(test, hrtimer_active(&ctx->runtime.cutoff_timer));
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_local_event(ctx, &key,
+		PVSCHED_RECONCILE_VMEXIT, 0, false, false), -EIO);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters + 1);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.restore_owed_error, 0);
 }
 
 static void pvsched_runner_unsupported_run_leave_test(struct kunit *test)
@@ -2671,6 +2882,10 @@ static struct kunit_case pvsched_runner_runtime_test_cases[] = {
 	KUNIT_CASE(pvsched_runner_remote_unsupported_is_record_only_test),
 	KUNIT_CASE(pvsched_runner_position_is_target_owned_test),
 	KUNIT_CASE(pvsched_runner_local_inject_refused_without_mutation_test),
+	KUNIT_CASE(pvsched_runner_guest_source_inject_uses_hard_work_test),
+	KUNIT_CASE(pvsched_runner_cleanup_visit_skips_snapshot_test),
+	KUNIT_CASE(pvsched_runner_nested_event_uses_retained_snapshot_test),
+	KUNIT_CASE(pvsched_runner_nested_vmentry_skips_page_test),
 	KUNIT_CASE(pvsched_runner_blocked_inject_is_record_only_test),
 	KUNIT_CASE(pvsched_runner_missing_guest_is_event_error_test),
 	KUNIT_CASE(pvsched_runner_revocation_skips_accounting_test),
@@ -2687,6 +2902,9 @@ static struct kunit_case pvsched_runner_runtime_test_cases[] = {
 	KUNIT_CASE(pvsched_runner_post_insert_abort_test),
 	KUNIT_CASE(pvsched_runner_binding_mismatch_cleanup_test),
 	KUNIT_CASE(pvsched_runner_binding_mismatch_vmentry_defers_test),
+	KUNIT_CASE(pvsched_runner_vmentry_publishes_to_page_test),
+	KUNIT_CASE(pvsched_runner_closed_vmentry_defers_restore_test),
+	KUNIT_CASE(pvsched_runner_disabled_vmentry_defers_restore_test),
 	KUNIT_CASE(pvsched_runner_unsupported_run_leave_test),
 	KUNIT_CASE(pvsched_runner_halt_not_ready_test),
 	KUNIT_CASE(pvsched_runner_unhalt_does_not_freshly_boost_test),
