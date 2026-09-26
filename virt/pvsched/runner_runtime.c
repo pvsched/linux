@@ -7,9 +7,9 @@
 #include <linux/sched/cputime.h>
 #include <linux/slab.h>
 #include <linux/string.h>
-#include <kunit/static_stub.h>
 #include <kunit/visibility.h>
 #include "runner_runtime.h"
+#include "lifecycle.h"
 
 static enum hrtimer_restart pvsched_cutoff_timer(struct hrtimer *timer)
 {
@@ -289,27 +289,35 @@ pvsched_restore_failed_locked(struct pvsched_runner_runtime *runtime,
 			   observed.nice, observed.rt_priority, error);
 }
 
+/* An internal failure must not leave an owned elevated value applied. */
 static int
-pvsched_fail_locked(struct pvsched_runner_runtime *runtime, int ret)
+pvsched_internal_fault_locked(struct pvsched_runner_runtime *runtime, int ret)
 {
 	int restore_ret;
 
-	/* External ownership is neither our fault nor ours to restore. */
-	if (ret == -EOWNERDEAD) {
-		pvsched_deactivate_locked(runtime);
-		return ret;
-	}
 	runtime->last_fault = ret;
 	/* One bounded restore attempt; failure is terminal until teardown. */
 	pvsched_deactivate_locked(runtime);
 	restore_ret = pvsched_restore_locked(runtime);
-	if (restore_ret == -EOWNERDEAD)
-		return ret;
-	if (restore_ret) {
-		pvsched_policy_bug_on(runtime, true);
+	if (pvsched_policy_bug_on(runtime,
+				  restore_ret && restore_ret != -EOWNERDEAD))
 		pvsched_restore_failed_locked(runtime, true, restore_ret);
-	}
+	else
+		pvsched_runner_request_cleanup_locked(&runtime->attachment);
 	return ret;
+}
+
+static int
+pvsched_run_leave_fail_locked(struct pvsched_runner_runtime *runtime, int error)
+{
+	if (error == -EOWNERDEAD || !pvsched_policy_owned(runtime)) {
+		pvsched_runner_request_cleanup_locked(&runtime->attachment);
+	} else {
+		pvsched_policy_bug_on(runtime, true);
+		pvsched_restore_failed_locked(runtime, true, error);
+	}
+	pvsched_deactivate_locked(runtime);
+	return error;
 }
 
 static int
@@ -323,7 +331,9 @@ pvsched_request_fail_locked(struct pvsched_runner_runtime *runtime,
 	restore_ret = pvsched_restore_locked(runtime);
 	if (restore_ret) {
 		pvsched_attachment_disable_locked(&runtime->attachment);
-		if (restore_ret != -EOWNERDEAD) {
+		if (restore_ret == -EOWNERDEAD) {
+			pvsched_runner_request_cleanup_locked(&runtime->attachment);
+		} else {
 			pvsched_policy_bug_on(runtime, true);
 			pvsched_restore_failed_locked(runtime, true,
 						      restore_ret);
@@ -629,10 +639,12 @@ pvsched_runner_reconcile_locked(struct pvsched_runner_runtime *runtime,
 			ret = 0;
 			goto out;
 		}
+		/* Otherwise the VMM only sees an INACTIVE runner. */
 		pr_warn_ratelimited("pvsched: runner %d: unsupported guest execution mode, revoking the attachment\n",
 				    task_pid_nr(runtime->attachment.task));
 		pvsched_deactivate_locked(runtime);
 		ret = pvsched_restore_locked(runtime);
+		pvsched_runner_request_cleanup_locked(&runtime->attachment);
 		runtime->revoke_pending = false;
 		if (pvsched_policy_bug_on(runtime, ret && ret != -EOWNERDEAD))
 			pvsched_restore_failed_locked(runtime, false, ret);
@@ -808,7 +820,7 @@ selected:
 apply_fault:
 	if (event == PVSCHED_RECONCILE_RUN_LEAVE) {
 		pvsched_idle_hold_reset(runtime);
-		ret = pvsched_fail_locked(runtime, ret);
+		ret = pvsched_run_leave_fail_locked(runtime, ret);
 		goto out;
 	}
 request_fault:
@@ -817,8 +829,7 @@ request_fault:
 	goto out;
 internal_fault:
 	pvsched_idle_hold_reset(runtime);
-	/* An internal failure must not leave an owned elevated value applied. */
-	ret = pvsched_fail_locked(runtime, ret);
+	ret = pvsched_internal_fault_locked(runtime, ret);
 out:
 	return ret;
 }
@@ -1036,22 +1047,6 @@ int pvsched_runner_local_reconcile(const void *vcpu_key,
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_local_reconcile);
 
-int pvsched_runner_cleanup_reconcile(struct task_struct *task,
-				     enum pvsched_reconcile_event event,
-				     const struct pvsched_runner_event_input *input)
-{
-	struct pvsched_runner_local_reconcile_ctx ctx = {
-		.event = event,
-		.input = input,
-		.ret = -ENOENT,
-	};
-
-	pvsched_attachment_cleanup_visit(task,
-		pvsched_runner_local_reconcile_visit, &ctx);
-	return ctx.ret;
-}
-EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_cleanup_reconcile);
-
 struct pvsched_runner_local_vmentry_ctx {
 	const struct pvsched_runner_vmentry_input *input;
 	struct pvsched_host_area *host;
@@ -1088,22 +1083,6 @@ int pvsched_runner_local_vmentry(const void *vcpu_key,
 	return ctx.ret;
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_local_vmentry);
-
-int pvsched_runner_cleanup_vmentry(struct task_struct *task,
-				   const struct pvsched_runner_vmentry_input *input,
-				   struct pvsched_host_area *host)
-{
-	struct pvsched_runner_local_vmentry_ctx ctx = {
-		.input = input,
-		.host = host,
-		.ret = -ENOENT,
-	};
-
-	pvsched_attachment_cleanup_visit(task,
-		pvsched_runner_local_vmentry_visit, &ctx);
-	return ctx.ret;
-}
-EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_cleanup_vmentry);
 
 void pvsched_runner_guest_exit_irqoff(struct pvsched_runner_runtime *runtime)
 {

@@ -184,10 +184,6 @@ static void pvsched_attachment_run_boundary_disable_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, found);
 	KUNIT_EXPECT_EQ(test, record.visits, 1U);
 	KUNIT_EXPECT_EQ(test, record.kind, PVSCHED_ATTACHMENT_VISIT_CLEANUP);
-	found = pvsched_attachment_cleanup_visit(current,
-						 pvsched_attachment_test_visit,
-						 &ctx->visits);
-	KUNIT_EXPECT_TRUE(test, found);
 }
 
 static void pvsched_attachment_changed_key_fails_closed_test(struct kunit *test)
@@ -211,9 +207,9 @@ static void pvsched_attachment_changed_key_fails_closed_test(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, ctx->attachment.vcpu.key, &first_key);
 	visited = pvsched_attachment_test_remote(&first_key, true, false, NULL);
 	KUNIT_EXPECT_EQ(test, visited, 0U);
-	found = pvsched_attachment_cleanup_visit(current,
-						 pvsched_attachment_test_visit,
-						 &ctx->visits);
+	found = pvsched_attachment_local_visit(&first_key, PVSCHED_RUNNER_HOST, 0,
+					       pvsched_attachment_test_visit,
+					       &ctx->visits);
 	KUNIT_EXPECT_TRUE(test, found);
 	KUNIT_EXPECT_EQ(test, ctx->visits, 1U);
 }
@@ -289,14 +285,14 @@ static void pvsched_attachment_exit_latch_test(struct kunit *test)
 
 	if (!ctx)
 		return;
-	KUNIT_EXPECT_TRUE(test, pvsched_attachment_mark_exited(current));
+	KUNIT_EXPECT_TRUE(test, pvsched_attachment_mark_exited(current,
+						      pvsched_attachment_test_visit,
+					      &ctx->visits));
 	KUNIT_EXPECT_TRUE(test, ctx->attachment.exited);
 	KUNIT_EXPECT_FALSE(test, ctx->attachment.active);
 	found = pvsched_attachment_test_local(&key, PVSCHED_RUNNER_HOST, NULL);
 	KUNIT_EXPECT_FALSE(test, found);
-	found = pvsched_attachment_cleanup_visit(current,
-						 NULL, NULL);
-	KUNIT_EXPECT_TRUE(test, found);
+	KUNIT_EXPECT_EQ(test, ctx->visits, 1U);
 }
 
 static void pvsched_attachment_publish_exit_rollback_test(struct kunit *test)

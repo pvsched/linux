@@ -19,37 +19,9 @@
 #include <linux/user_namespace.h>
 #include <uapi/linux/pvsched.h>
 
+#include "internal.h"
+#include "lifecycle.h"
 #include "policy.h"
-
-/*
- * Resource limits, reported to userspace by GET_INFO.  A session holds at
- * most one shared page per runner; the global page count is kept for
- * attachments that may one day span more than one page.
- */
-#define PVSCHED_MAX_RUNNERS_PER_SESSION		1024
-#define PVSCHED_MAX_RUNNERS_GLOBAL		16384
-#define PVSCHED_MAX_SESSIONS_GLOBAL		256
-#define PVSCHED_MAX_SHM_PAGES_PER_SESSION	1024
-#define PVSCHED_MAX_SHM_PAGES_GLOBAL		16384
-
-struct pvsched_vcpu_runner {
-	struct list_head session_node;
-	struct hlist_node global_node;
-	struct pid *pid;
-	u64 runner_id;
-};
-
-struct pvsched_session {
-	/* Serializes this session's control operations and runner list. */
-	struct mutex lock;
-	/* The policy SET_POLICY pinned, fixed for the session's life. */
-	struct pvsched_policy_entry *entry;
-	struct list_head runners;
-	struct mm_struct *owner_mm;
-	struct pid *owner_tgid;
-	u64 next_runner_id;
-	u32 nr_runners;
-};
 
 static DEFINE_SPINLOCK(pvsched_global_lock);
 static DEFINE_HASHTABLE(pvsched_runner_hash, 14);
@@ -216,6 +188,13 @@ static long pvsched_create_runner(struct pvsched_session *session,
 	}
 	runner->pid = runner_pid;
 	runner->runner_id = runner_id;
+	ret = pvsched_runner_lifecycle_init(runner, session,
+					    session->entry->ops->params_size);
+	if (ret) {
+		kfree(runner);
+		runner = NULL;
+		goto out_cleanup;
+	}
 
 	output = (struct pvsched_create_runner) {
 		.tid = input.tid,
@@ -238,6 +217,8 @@ static long pvsched_create_runner(struct pvsched_session *session,
 	return 0;
 
 out_cleanup:
+	if (runner)
+		pvsched_runner_lifecycle_destroy(runner);
 	kfree(runner);
 	put_pid(runner_pid);
 	put_pid(target_tgid);
@@ -254,7 +235,6 @@ static long pvsched_query_runner(struct pvsched_session *session,
 {
 	struct pvsched_query_runner input, output;
 	struct pvsched_vcpu_runner *runner;
-	struct task_struct *task;
 
 	if (copy_from_user(&input, argp, sizeof(input)))
 		return -EFAULT;
@@ -267,13 +247,11 @@ static long pvsched_query_runner(struct pvsched_session *session,
 	if (!runner)
 		return -ENOENT;
 
-	task = get_pid_task(runner->pid, PIDTYPE_PID);
 	output = (struct pvsched_query_runner) {
 		.runner_id = input.runner_id,
-		.state = task ? PVSCHED_RUNNER_INACTIVE : PVSCHED_RUNNER_EXITED,
 	};
-	if (task)
-		put_task_struct(task);
+	pvsched_runner_query_locked(runner, &output.state, &output.flags,
+				    &output.last_fault_errno);
 
 	return copy_to_user(argp, &output, sizeof(output)) ? -EFAULT : 0;
 }
@@ -343,6 +321,10 @@ static int pvsched_release(struct inode *inode, struct file *file)
 	struct pvsched_vcpu_runner *runner, *next;
 
 	mutex_lock(&session->lock);
+	session->closing = true;
+	mutex_unlock(&session->lock);
+	pvsched_session_release_runtimes(session);
+	mutex_lock(&session->lock);
 	spin_lock(&pvsched_global_lock);
 	list_for_each_entry(runner, &session->runners, session_node)
 		hash_del(&runner->global_node);
@@ -351,6 +333,7 @@ static int pvsched_release(struct inode *inode, struct file *file)
 
 	list_for_each_entry_safe(runner, next, &session->runners, session_node) {
 		put_pid(runner->pid);
+		pvsched_runner_lifecycle_destroy(runner);
 		kfree(runner);
 	}
 	/* No runtime can call the policy any more. */

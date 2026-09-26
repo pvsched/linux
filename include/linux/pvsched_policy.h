@@ -106,8 +106,9 @@ struct pvsched_map_input {
  * @apply: apply parameters to ctx->task
  * @owned: optional; whether ctx->task still has the value applied last
  *
- * @capture_baseline runs in process context and may sleep.  pvsched zeroes
- * the baseline buffer before it; a nonzero return refuses the attach.
+ * @capture_baseline runs in process context under the session mutex and may
+ * sleep.  pvsched zeroes the baseline buffer before it; a nonzero return
+ * refuses the attach.
  *
  * @map, @apply and @owned run with the attachment's raw state lock held and
  * IRQs off, at run entry, the IRQ-on VM exit, a cancelled entry, halt, an
