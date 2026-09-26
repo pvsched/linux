@@ -36,6 +36,7 @@ enum pvsched_runner_mode_flag {
 };
 
 struct pvsched_attachment;
+struct pvsched_vcpu_runner;
 
 /* Immutable remote-lookup identity, installed on the first local hook. */
 struct pvsched_vcpu_key {
@@ -61,6 +62,8 @@ struct pvsched_attachment {
 	struct mm_struct *owner_mm;
 	/* Thread group captured at initialization for local-hook admission. */
 	struct pid *owner_tgid;
+	/* Session-lifetime owner, installed before hash publication. */
+	struct pvsched_vcpu_runner *runner;
 	/* Target-local lookup link, keyed by the stable task pointer. */
 	struct hlist_node task_node;
 	/* Remote-injection lookup identity, bound once on first local use. */
@@ -73,8 +76,10 @@ struct pvsched_attachment {
 	bool exited;
 	/* A missing or changed vCPU key permanently failed this binding. */
 	bool binding_failed;
-	/* Key mismatch or late VMENTRY owes a setter-safe baseline restore. */
-	bool restore_owed;
+	/* Automatic resource teardown requested by a locked factual trigger. */
+	bool teardown_requested;
+	/* Final session close forbids any later cleanup-work enqueue. */
+	bool cleanup_enqueue_closed;
 	/* Whether a target-local hook has supplied a mode fact. */
 	bool target_mode_valid;
 	/* Last target-local mode flags used to validate remote callbacks. */
@@ -118,13 +123,9 @@ bool pvsched_attachment_local_visit(const void *vcpu_key,
 				    pvsched_attachment_visit_fn visit,
 				    void *data);
 
-/* Exit and mandatory cleanup remain discoverable after ordinary admission. */
-bool pvsched_attachment_cleanup_visit(struct task_struct *task,
-				      pvsched_attachment_visit_fn visit,
-				      void *data);
-
 /* Exit latches independently of ordinary owner-mm/TGID admission. */
-bool pvsched_attachment_mark_exited(struct task_struct *task);
+bool pvsched_attachment_mark_exited(struct task_struct *task,
+				    pvsched_attachment_visit_fn visit, void *data);
 
 /*
  * Called by injection hooks. RCU spans the visit, and state_lock supplies the
