@@ -108,20 +108,21 @@ enum pvsched_runner_restore_disposition {
 };
 
 /*
- * Currently defined subset of the per-vCPU call order for activation wiring:
+ * Per-vCPU call order used by the production KVM adapters.  Every local
+ * event goes through pvsched_runner_local_event(), which snapshots guest
+ * input and publishes VMENTRY feedback only through the shared-page bridge:
  *
  * ATTACH_SHM             -> prepare, then one final publish
- * RUN_ENTER              -> pvsched_runner_reconcile(RUN_ENTER, facts)
- * late VMENTRY, IRQ-off  -> pvsched_runner_vmentry()
- * fast re-entry          -> pvsched_runner_vmentry()
- * IRQ-off VMEXIT         -> pvsched_runner_guest_exit_irqoff()
- * IRQ-on VMEXIT          -> pvsched_runner_reconcile(VMEXIT)
- * VMENTRY_CANCEL         -> pvsched_runner_reconcile(CANCEL)
- * RUN_LEAVE              -> pvsched_runner_reconcile(RUN_LEAVE)
+ * RUN_ENTER, IRQ-on VMEXIT, VMENTRY_CANCEL, HALT, UNHALT, RUN_LEAVE
+ *                        -> pvsched_runner_local_event(event)
+ * late VMENTRY, IRQ-off (including fast re-entry)
+ *                        -> pvsched_runner_local_event(..., vmentry = true)
+ * IRQ-off VMEXIT         -> pvsched_runner_local_guest_exit_irqoff()
+ * INJECT                 -> pvsched_runner_remote_inject()
  * DETACH / final close   -> split disable/drain/disposition/unhash/release
  *
- * HALT, UNHALT, and INJECT are private events here; their KVM
- * adapters, remote lookup, and source-mode deferral are not wired yet.
+ * pvsched_runner_reconcile() and pvsched_runner_vmentry() drive one runtime
+ * directly and exist for KUnit; they never see the shared page.
  */
 
 /**
@@ -183,21 +184,22 @@ int pvsched_runner_reconcile(struct pvsched_runner_runtime *runtime,
 			     enum pvsched_reconcile_event event,
 			     const struct pvsched_runner_event_input *input);
 
-/* Target-local adapters that find the runtime by its vCPU key. */
-int pvsched_runner_local_reconcile(const void *vcpu_key,
-				   enum pvsched_reconcile_event event,
-				   const struct pvsched_runner_event_input *input);
-
 /* Apply or defer one vCPU-keyed remote injection fact. */
 unsigned int pvsched_runner_remote_inject(const void *vcpu_key,
 					  u32 mode_flags,
 					  bool source_guest_mode);
+/* Target-local adapters that find the runtime by its vCPU key. */
+int pvsched_runner_local_event(const void *vcpu_key,
+			       enum pvsched_reconcile_event event,
+			       u32 mode_flags, bool vmentry,
+			       bool interrupt_ready);
+void pvsched_runner_local_guest_exit_irqoff(const void *vcpu_key);
 
 /**
  * pvsched_runner_vmentry() - account, hand off a ticket, and publish feedback
  * @runtime: initialized per-attachment state
  * @input: local acquire-ordered guest/ack snapshot and late KVM facts
- * @host: host-area output snapshot
+ * @host: caller-owned staging output, never the shared page
  *
  * Called at late VMENTRY with IRQs and preemption disabled, after KVM's last
  * reschedule check.  It never calls the scheduler setter.  Returns 0,
@@ -208,9 +210,6 @@ unsigned int pvsched_runner_remote_inject(const void *vcpu_key,
 int pvsched_runner_vmentry(struct pvsched_runner_runtime *runtime,
 			   const struct pvsched_runner_vmentry_input *input,
 			   struct pvsched_host_area *host);
-int pvsched_runner_local_vmentry(const void *vcpu_key,
-				 const struct pvsched_runner_vmentry_input *input,
-				 struct pvsched_host_area *host);
 
 /**
  * pvsched_runner_guest_exit_irqoff() - cancel the current GUEST cutoff timer

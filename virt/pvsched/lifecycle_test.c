@@ -185,6 +185,9 @@ static int pvsched_lifecycle_test_init(struct kunit *test)
 	return test->priv ? 0 : -ENOMEM;
 }
 
+/* Published runtimes need a mapped page; these tests never inspect it. */
+static union pvsched_vcpu_page pvsched_lifecycle_page;
+
 static int pvsched_lifecycle_attach(struct pvsched_lifecycle_test_ctx *ctx,
 				    struct pvsched_vcpu_runner *runner,
 				    struct task_struct *task)
@@ -201,6 +204,7 @@ static int pvsched_lifecycle_attach(struct pvsched_lifecycle_test_ctx *ctx,
 					     &runner->ticket_owner, true);
 	if (ret)
 		goto free;
+	runtime->attachment.shm.addr = &pvsched_lifecycle_page;
 	mutex_lock(&ctx->session.lock);
 	ret = pvsched_runner_publish_runtime_locked(runner, runtime,
 						    NULL, NULL);
@@ -426,6 +430,7 @@ static void pvsched_lifecycle_publish_exit_stale_work_test(struct kunit *test)
 	kunit_activate_static_stub(test, pvsched_attachment_owner_snapshot,
 				   pvsched_lifecycle_test_owner_exit);
 	mutex_lock(&session.lock);
+	runtime.attachment.shm.addr = &pvsched_lifecycle_page;
 	ret = pvsched_runner_publish_runtime_locked(&runner, &runtime, NULL,
 						    NULL);
 	mutex_unlock(&session.lock);
@@ -469,6 +474,7 @@ static void pvsched_lifecycle_duplicate_zero_drain_test(struct kunit *test)
 	kunit_activate_static_stub(test, pvsched_attachment_drain,
 				   pvsched_lifecycle_test_drain);
 	mutex_lock(&ctx->session.lock);
+	duplicate.attachment.shm.addr = &pvsched_lifecycle_page;
 	ret = pvsched_runner_publish_runtime_locked(&second, &duplicate,
 						    NULL, NULL);
 	mutex_unlock(&ctx->session.lock);
