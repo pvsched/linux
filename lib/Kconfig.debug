@@ -2398,6 +2398,18 @@ config PVSCHED_ATTACHMENT_KUNIT_TEST
 
 	  If unsure, say N.
 
+config PVSCHED_LIFECYCLE_KUNIT_TEST
+	tristate "KUnit test for pvsched session lifecycle" if !KUNIT_ALL_TESTS
+	depends on KUNIT && PVSCHED && !PREEMPT_RT
+	default KUNIT_ALL_TESTS
+	help
+	  Exercise runner ownership, automatic cleanup work, persistent
+	  history and batched final session close.
+	  The suite also covers publication rollback, real cleanup-work races,
+	  scheduler restoration and one shared RCU drain during final close.
+
+	  If unsure, say N.
+
 config TEST_LIST_SORT
 	tristate "Linked list sorting test" if !KUNIT_ALL_TESTS
 	depends on KUNIT
