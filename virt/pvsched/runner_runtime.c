@@ -3,6 +3,8 @@
 #include <linux/errno.h>
 #include <linux/export.h>
 #include <linux/ktime.h>
+#include <linux/cpu.h>
+#include <linux/smp.h>
 #include <linux/sched/cputime.h>
 #include <linux/string.h>
 #include <uapi/linux/sched/types.h>
@@ -25,6 +27,8 @@ static bool pvsched_mode_nested(u32 mode_flags)
 {
 	return mode_flags & PVSCHED_RUNNER_MODE_NESTED;
 }
+
+static void pvsched_runner_inject_work(struct irq_work *work);
 
 static void
 pvsched_reset_host_initiated_boost_locked(struct pvsched_runner_runtime *runtime)
@@ -353,6 +357,7 @@ int pvsched_runner_runtime_prepare(struct pvsched_runner_runtime *runtime,
 	memset(runtime, 0, sizeof(*runtime));
 	hrtimer_setup(&runtime->cutoff_timer, pvsched_cutoff_timer,
 		      CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED_HARD);
+	runtime->inject_work = IRQ_WORK_INIT_HARD(pvsched_runner_inject_work);
 	ret = pvsched_attachment_init(&runtime->attachment, task);
 	if (ret)
 		return ret;
@@ -416,6 +421,7 @@ void pvsched_runner_runtime_drain_actions(struct pvsched_runner_runtime *runtime
 {
 	WARN_ON_ONCE(!runtime->closing);
 	hrtimer_cancel(&runtime->cutoff_timer);
+	irq_work_sync(&runtime->inject_work);
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_drain_actions);
 
@@ -500,23 +506,6 @@ pvsched_runner_reconcile_locked(struct pvsched_runner_runtime *runtime,
 	int event_ret = 0;
 	int ret;
 
-	/* Only target-local hooks advance the runner-owned position. */
-	switch (event) {
-	case PVSCHED_RECONCILE_RUN_ENTER:
-	case PVSCHED_RECONCILE_UNHALT:
-	case PVSCHED_RECONCILE_VMEXIT:
-	case PVSCHED_RECONCILE_CANCEL:
-		runtime->attachment.position = PVSCHED_RUNNER_HOST;
-		break;
-	case PVSCHED_RECONCILE_HALT:
-		runtime->attachment.position = PVSCHED_RUNNER_BLOCKED;
-		break;
-	case PVSCHED_RECONCILE_RUN_LEAVE:
-		runtime->attachment.position = PVSCHED_RUNNER_QEMU;
-		break;
-	default:
-		break;
-	}
 	/* Mandatory cleanup precedes admission and policy selection. */
 	if (runtime->attachment.exited) {
 		ret = -ESRCH;
@@ -849,7 +838,6 @@ pvsched_runner_vmentry_locked(struct pvsched_runner_runtime *runtime,
 	bool was_host;
 	int ret = -ESHUTDOWN;
 
-	runtime->attachment.position = PVSCHED_RUNNER_GUEST;
 	nested = pvsched_mode_nested(input->mode_flags);
 	runtime->nested_l2 = nested;
 	if (runtime->restore_owed_error && !runtime->closing &&
@@ -979,6 +967,10 @@ int pvsched_runner_local_reconcile(const void *vcpu_key,
 	};
 	enum pvsched_runner_position position;
 
+	/* INJECT is exclusively vCPU-keyed and must not mutate local facts. */
+	if (event == PVSCHED_RECONCILE_INJECT)
+		return -EINVAL;
+
 	switch (event) {
 	case PVSCHED_RECONCILE_HALT:
 		position = PVSCHED_RUNNER_BLOCKED;
@@ -996,6 +988,84 @@ int pvsched_runner_local_reconcile(const void *vcpu_key,
 	return ctx.ret;
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_local_reconcile);
+
+struct pvsched_runner_remote_inject_ctx {
+	u32 mode_flags;
+	bool source_guest_mode;
+};
+
+static void
+pvsched_runner_remote_inject_visit(struct pvsched_attachment *attachment,
+				   enum pvsched_attachment_visit_kind kind,
+				   void *data)
+{
+	struct pvsched_runner_remote_inject_ctx *ctx = data;
+	struct pvsched_runner_runtime *runtime =
+		container_of(attachment, struct pvsched_runner_runtime, attachment);
+	struct pvsched_runner_event_input input = {
+		.mode_flags = ctx->mode_flags,
+	};
+	int cpu;
+
+	if (kind != PVSCHED_ATTACHMENT_VISIT_ORDINARY)
+		return;
+	if (attachment->position == PVSCHED_RUNNER_HOST &&
+	    !task_is_runnable(attachment->task))
+		return;
+	if (!ctx->source_guest_mode) {
+		pvsched_runner_reconcile_locked(runtime,
+						PVSCHED_RECONCILE_INJECT, &input);
+		return;
+	}
+	if (!task_is_runnable(attachment->task))
+		return;
+	runtime->inject_mode_flags = ctx->mode_flags;
+	cpu = task_cpu(attachment->task);
+	if (cpu != smp_processor_id() && cpu_online(cpu))
+		irq_work_queue_on(&runtime->inject_work, cpu);
+	else
+		irq_work_queue(&runtime->inject_work);
+}
+
+unsigned int pvsched_runner_remote_inject(const void *vcpu_key,
+					  u32 mode_flags,
+					  bool source_guest_mode)
+{
+	struct pvsched_runner_remote_inject_ctx ctx = {
+		.mode_flags = mode_flags,
+		.source_guest_mode = source_guest_mode,
+	};
+
+	return pvsched_attachment_remote_visit(vcpu_key, mode_flags,
+					       pvsched_runner_remote_inject_visit, &ctx);
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_remote_inject);
+
+static void pvsched_runner_inject_work(struct irq_work *work)
+{
+	struct pvsched_runner_runtime *runtime =
+		container_of(work, struct pvsched_runner_runtime, inject_work);
+	struct pvsched_runner_event_input input;
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&runtime->attachment.state_lock, flags);
+	if (!runtime->attachment.active ||
+	    !runtime->attachment.target_mode_valid ||
+	    (runtime->attachment.target_mode_flags &
+	     (PVSCHED_RUNNER_MODE_NESTED | PVSCHED_RUNNER_MODE_UNSUPPORTED)) ||
+	    (runtime->attachment.position != PVSCHED_RUNNER_HOST &&
+	     runtime->attachment.position != PVSCHED_RUNNER_BLOCKED) ||
+	    (runtime->attachment.position == PVSCHED_RUNNER_HOST &&
+	     !task_is_runnable(runtime->attachment.task)))
+		goto unlock;
+	input = (struct pvsched_runner_event_input) {
+		.mode_flags = runtime->inject_mode_flags,
+	};
+	pvsched_runner_reconcile_locked(runtime, PVSCHED_RECONCILE_INJECT,
+					&input);
+unlock:
+	raw_spin_unlock_irqrestore(&runtime->attachment.state_lock, flags);
+}
 
 struct pvsched_runner_local_vmentry_ctx {
 	const struct pvsched_runner_vmentry_input *input;

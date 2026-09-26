@@ -5,6 +5,7 @@
 #include <linux/bits.h>
 #include <linux/sched.h>
 #include <linux/hrtimer.h>
+#include <linux/irq_work.h>
 #include <linux/spinlock.h>
 #include <uapi/linux/pvsched.h>
 
@@ -69,6 +70,10 @@ struct pvsched_runner_runtime {
 	struct pvsched_ticket_owner *ticket_owner;
 	/* Pinned hard cap timer; its callback only forces a nonfast exit. */
 	struct hrtimer cutoff_timer;
+	/* Source-guest-mode injection is applied after guest state is unloaded. */
+	struct irq_work inject_work;
+	/* Mode snapshot coalesced for the pending injection work. */
+	u32 inject_mode_flags;
 	/* Latest owned-fault errno; external ownership does not set it. */
 	int last_fault;
 	/*
@@ -195,6 +200,11 @@ int pvsched_runner_reconcile(struct pvsched_runner_runtime *runtime,
 int pvsched_runner_local_reconcile(const void *vcpu_key,
 				   enum pvsched_reconcile_event event,
 				   const struct pvsched_runner_event_input *input);
+
+/* Apply or defer one vCPU-keyed remote injection fact. */
+unsigned int pvsched_runner_remote_inject(const void *vcpu_key,
+					  u32 mode_flags,
+					  bool source_guest_mode);
 
 /**
  * pvsched_runner_vmentry() - account, hand off a ticket, and publish feedback

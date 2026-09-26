@@ -1082,17 +1082,19 @@ static void pvsched_runner_remote_unsupported_is_record_only_test(struct kunit *
 static void pvsched_runner_position_is_target_owned_test(struct kunit *test)
 {
 	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_runner_event_input input = { .guest = &guest };
 	struct pvsched_runner_event_input inject = { };
 	struct pvsched_runner_test_ctx *ctx;
 	u32 setters;
+	int key;
 
 	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
 	if (!ctx)
 		return;
-	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
-		PVSCHED_RECONCILE_RUN_ENTER, &guest), 0);
-	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
-		PVSCHED_RECONCILE_RUN_LEAVE, NULL), 0);
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_local_reconcile(ctx, &key,
+		PVSCHED_RECONCILE_RUN_ENTER, &input), 0);
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_local_reconcile(ctx, &key,
+		PVSCHED_RECONCILE_RUN_LEAVE, &input), 0);
 	setters = pvsched_runner_test_setter_calls(test);
 	KUNIT_ASSERT_EQ(test, pvsched_runner_reconcile(&ctx->runtime,
 		PVSCHED_RECONCILE_INJECT, &inject), 0);
@@ -1106,8 +1108,9 @@ static void pvsched_runner_position_is_target_owned_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, pvsched_runner_reconcile(&ctx->runtime,
 		PVSCHED_RECONCILE_INJECT, &inject), 0);
 	KUNIT_EXPECT_FALSE(test, ctx->runtime.nested_l2);
-	ctx->runtime.attachment.position = PVSCHED_RUNNER_HOST;
-	ctx->runtime.nested_l2 = true;
+	input.mode_flags = PVSCHED_RUNNER_MODE_NESTED;
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_local_reconcile(ctx, &key,
+		PVSCHED_RECONCILE_RUN_ENTER, &input), 0);
 	inject.mode_flags = 0;
 	KUNIT_ASSERT_EQ(test, pvsched_runner_reconcile(&ctx->runtime,
 		PVSCHED_RECONCILE_INJECT, &inject), 0);
@@ -1118,19 +1121,21 @@ static void pvsched_runner_position_is_target_owned_test(struct kunit *test)
 static void pvsched_runner_blocked_inject_is_record_only_test(struct kunit *test)
 {
 	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_runner_event_input input = { .guest = &guest };
 	struct pvsched_runner_event_input inject = { };
 	struct pvsched_runner_test_ctx *ctx;
 	u32 setters;
+	int key;
 
 	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
 	if (!ctx)
 		return;
-	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
-		PVSCHED_RECONCILE_RUN_ENTER, &guest), 0);
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_local_reconcile(ctx, &key,
+		PVSCHED_RECONCILE_RUN_ENTER, &input), 0);
 	ctx->runtime.accounting.accounting.cs.debt_ns = U64_MAX;
 	ctx->runtime.accounting.accounting.cs.throttled = true;
-	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
-		PVSCHED_RECONCILE_HALT, &guest), 0);
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_local_reconcile(ctx, &key,
+		PVSCHED_RECONCILE_HALT, &input), 0);
 	pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, 0, 0);
 	ctx->runtime.accounting.accounting.cs.debt_ns = 0;
 	ctx->runtime.accounting.accounting.cs.throttled = false;
@@ -1140,8 +1145,8 @@ static void pvsched_runner_blocked_inject_is_record_only_test(struct kunit *test
 	KUNIT_EXPECT_TRUE(test, ctx->runtime.reasons &
 			  PVSCHED_RUNNER_REASON_INJECT);
 	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters);
-	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
-		PVSCHED_RECONCILE_UNHALT, NULL), 0);
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_local_reconcile(ctx, &key,
+		PVSCHED_RECONCILE_UNHALT, &input), 0);
 	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters);
 	KUNIT_ASSERT_EQ(test, pvsched_runner_reconcile(&ctx->runtime,
 		PVSCHED_RECONCILE_INJECT, &inject), 0);
