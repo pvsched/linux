@@ -4,14 +4,24 @@
 #include <kunit/static_stub.h>
 #include <linux/completion.h>
 #include <linux/kthread.h>
+#include <linux/sched/signal.h>
 #include <linux/sched/task.h>
 #include <uapi/linux/sched/types.h>
 
 #include "default_policy.h"
 #include "runner_runtime.h"
 
+enum pvsched_runner_test_command {
+	PVSCHED_TEST_COMMAND_NONE,
+	PVSCHED_TEST_COMMAND_RECONCILE,
+	PVSCHED_TEST_COMMAND_VMENTRY,
+	PVSCHED_TEST_COMMAND_STOP,
+};
+
 struct pvsched_runner_test_ctx {
 	struct completion ready;
+	struct completion command_ready;
+	struct completion command_done;
 	struct task_struct *task;
 	struct pvsched_runner_runtime runtime;
 	struct sched_attr original_attr;
@@ -19,6 +29,13 @@ struct pvsched_runner_test_ctx {
 	u64 original_slack_ns;
 	bool runtime_live;
 	bool original_valid;
+	enum pvsched_runner_test_command command;
+	const void *command_key;
+	enum pvsched_reconcile_event command_event;
+	const struct pvsched_runner_event_input *command_input;
+	const struct pvsched_runner_vmentry_input *command_vmentry;
+	struct pvsched_host_area *command_host;
+	int command_ret;
 };
 
 /*
@@ -35,6 +52,8 @@ static_assert(sizeof(struct pvsched_runner_test_params) == 40);
 
 struct pvsched_runner_test_state {
 	u32 setter_calls;
+	u32 drain_calls;
+	u32 fail_setter_calls;
 	/* Test policy knobs and observations. */
 	u32 map_calls;
 	int map_error;
@@ -110,6 +129,10 @@ static int pvsched_runner_test_apply(struct pvsched_policy_ctx *ctx,
 		state->apply_error = 0;
 		return ret;
 	}
+	if (state->fail_setter_calls) {
+		state->fail_setter_calls--;
+		return -EIO;
+	}
 	ret = pvsched_default_policy_ops.apply(ctx, params);
 	if (!ret)
 		memcpy(&state->last_applied, params, sizeof(state->last_applied));
@@ -181,6 +204,27 @@ static void pvsched_runner_suite_exit(struct kunit_suite *suite)
 	pvsched_policy_entry_put(pvsched_runner_test_entry);
 }
 
+static void pvsched_runner_test_drain(void)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct pvsched_runner_test_state *state = test->priv;
+
+	state->drain_calls++;
+	synchronize_rcu();
+}
+
+static void pvsched_runner_test_owner_exiting(struct task_struct *task,
+					      struct mm_struct **mm,
+					      struct pid **tgid,
+					      bool *exiting)
+{
+	task_lock(task);
+	*mm = task->mm;
+	*tgid = task_tgid(task);
+	*exiting = true;
+	task_unlock(task);
+}
+
 static int pvsched_runner_test_init(struct kunit *test)
 {
 	struct pvsched_runner_test_state *state;
@@ -199,9 +243,53 @@ static int pvsched_runner_test_thread(void *data)
 	struct pvsched_runner_test_ctx *ctx = data;
 
 	complete(&ctx->ready);
-	while (!kthread_should_stop())
-		schedule_timeout_interruptible(HZ);
+	while (!kthread_should_stop()) {
+		wait_for_completion_interruptible(&ctx->command_ready);
+		if (kthread_should_stop() ||
+		    ctx->command == PVSCHED_TEST_COMMAND_STOP)
+			break;
+		if (ctx->command == PVSCHED_TEST_COMMAND_RECONCILE)
+			ctx->command_ret = pvsched_runner_local_reconcile(
+				ctx->command_key, ctx->command_event,
+				ctx->command_input);
+		else if (ctx->command == PVSCHED_TEST_COMMAND_VMENTRY)
+			ctx->command_ret = pvsched_runner_local_vmentry(
+				ctx->command_key, ctx->command_vmentry,
+				ctx->command_host);
+		ctx->command = PVSCHED_TEST_COMMAND_NONE;
+		complete(&ctx->command_done);
+	}
 	return 0;
+}
+
+static int pvsched_runner_test_local_reconcile(
+	struct pvsched_runner_test_ctx *ctx, const void *key,
+	enum pvsched_reconcile_event event,
+	const struct pvsched_runner_event_input *input)
+{
+	reinit_completion(&ctx->command_done);
+	ctx->command_key = key;
+	ctx->command_event = event;
+	ctx->command_input = input;
+	ctx->command = PVSCHED_TEST_COMMAND_RECONCILE;
+	complete(&ctx->command_ready);
+	wait_for_completion(&ctx->command_done);
+	return ctx->command_ret;
+}
+
+static int pvsched_runner_test_local_vmentry(
+	struct pvsched_runner_test_ctx *ctx, const void *key,
+	const struct pvsched_runner_vmentry_input *input,
+	struct pvsched_host_area *host)
+{
+	reinit_completion(&ctx->command_done);
+	ctx->command_key = key;
+	ctx->command_vmentry = input;
+	ctx->command_host = host;
+	ctx->command = PVSCHED_TEST_COMMAND_VMENTRY;
+	complete(&ctx->command_ready);
+	wait_for_completion(&ctx->command_done);
+	return ctx->command_ret;
 }
 
 static struct pvsched_default_guest_area pvsched_runner_test_guest(void)
@@ -232,12 +320,26 @@ static int pvsched_runner_test_guest_start(struct pvsched_runner_runtime *runtim
 	return pvsched_runner_vmentry(runtime, &input, &host);
 }
 
+static void pvsched_runner_test_stop_thread(struct pvsched_runner_test_ctx *ctx)
+{
+	if (!ctx->task)
+		return;
+	ctx->command = PVSCHED_TEST_COMMAND_STOP;
+	complete(&ctx->command_ready);
+	kthread_stop(ctx->task);
+}
+
 static void pvsched_runner_test_cleanup(void *data)
 {
 	struct pvsched_runner_test_ctx *ctx = data;
 
 	if (ctx->runtime_live) {
-		pvsched_runner_runtime_destroy(&ctx->runtime);
+		pvsched_runner_runtime_disable(&ctx->runtime);
+		pvsched_runner_runtime_drain_actions(&ctx->runtime);
+		pvsched_runner_runtime_finish_close(&ctx->runtime, true);
+		pvsched_runner_runtime_unhash(&ctx->runtime);
+		pvsched_attachment_drain();
+		pvsched_runner_runtime_release(&ctx->runtime);
 		ctx->runtime_live = false;
 	}
 	if (ctx->task && ctx->original_valid) {
@@ -246,8 +348,7 @@ static void pvsched_runner_test_cleanup(void *data)
 		ctx->task->timer_slack_ns = ctx->original_slack_ns;
 		task_unlock(ctx->task);
 	}
-	if (ctx->task)
-		kthread_stop(ctx->task);
+	pvsched_runner_test_stop_thread(ctx);
 }
 
 static struct pvsched_runner_test_ctx *
@@ -266,6 +367,8 @@ pvsched_runner_test_setup_policy(struct kunit *test,
 		return NULL;
 	}
 	init_completion(&ctx->ready);
+	init_completion(&ctx->command_ready);
+	init_completion(&ctx->command_done);
 	ctx->task = kthread_run(pvsched_runner_test_thread, ctx,
 				"pvsched-runner-test");
 	if (IS_ERR(ctx->task)) {
@@ -276,7 +379,7 @@ pvsched_runner_test_setup_policy(struct kunit *test,
 	}
 	if (!wait_for_completion_timeout(&ctx->ready, HZ)) {
 		KUNIT_FAIL(test, "runner test kthread did not start");
-		kthread_stop(ctx->task);
+		pvsched_runner_test_stop_thread(ctx);
 		ctx->task = NULL;
 		return NULL;
 	}
@@ -284,7 +387,7 @@ pvsched_runner_test_setup_policy(struct kunit *test,
 	sched_get_task_state(ctx->task, &state);
 	if (state.policy != SCHED_NORMAL || state.scx_active) {
 		kunit_skip(test, "requires a SCHED_NORMAL kthread with sched_ext inactive");
-		kthread_stop(ctx->task);
+		pvsched_runner_test_stop_thread(ctx);
 		ctx->task = NULL;
 		return NULL;
 	}
@@ -315,11 +418,18 @@ pvsched_runner_test_setup_policy(struct kunit *test,
 		ctx->task->timer_slack_ns = slack_ns;
 		task_unlock(ctx->task);
 	}
-	ret = pvsched_runner_runtime_init(&ctx->runtime, ctx->task, 1,
+	ret = pvsched_runner_runtime_prepare(&ctx->runtime, ctx->task,
 				  entry, NSEC_PER_SEC,
 				  NSEC_PER_SEC, &ctx->ticket_owner, true);
 	if (ret) {
 		KUNIT_FAIL(test, "failed to initialize runner runtime: %d", ret);
+		pvsched_runner_test_cleanup(ctx);
+		return NULL;
+	}
+	ret = pvsched_runner_runtime_publish(&ctx->runtime, NULL, NULL);
+	if (ret) {
+		KUNIT_FAIL(test, "failed to publish runner runtime: %d", ret);
+		pvsched_runner_runtime_release(&ctx->runtime);
 		pvsched_runner_test_cleanup(ctx);
 		return NULL;
 	}
@@ -1237,8 +1347,208 @@ static void pvsched_runner_closing_services_deferred_restore_test(struct kunit *
 		PVSCHED_RECONCILE_CANCEL, &guest), -EIO);
 	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters + 1);
 	pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, 5, 0);
-	pvsched_runner_runtime_destroy(&ctx->runtime);
+	pvsched_runner_runtime_disable(&ctx->runtime);
+	pvsched_runner_runtime_drain_actions(&ctx->runtime);
+	pvsched_runner_runtime_finish_close(&ctx->runtime, true);
+	pvsched_runner_runtime_unhash(&ctx->runtime);
+	pvsched_attachment_drain();
+	pvsched_runner_runtime_release(&ctx->runtime);
 	ctx->runtime_live = false;
+	pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, 5, 0);
+}
+
+static void pvsched_runner_split_close_test(struct kunit *test)
+{
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_runner_test_ctx *ctx;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	guest.cs_state = cpu_to_le64(PVSCHED_CS_NMI);
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+		PVSCHED_RECONCILE_RUN_ENTER, &guest), 0);
+	pvsched_runner_expect_state(test, ctx->task, SCHED_FIFO, 5, 60);
+	pvsched_runner_runtime_disable(&ctx->runtime);
+	KUNIT_EXPECT_FALSE(test, ctx->runtime.attachment.active);
+	pvsched_runner_runtime_drain_actions(&ctx->runtime);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_runtime_finish_close(&ctx->runtime,
+			true), PVSCHED_RESTORE_RESTORED);
+	pvsched_runner_runtime_unhash(&ctx->runtime);
+	KUNIT_EXPECT_FALSE(test, ctx->runtime.attachment.task_hashed);
+	pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, 5, 0);
+	pvsched_attachment_drain();
+	pvsched_runner_runtime_release(&ctx->runtime);
+	ctx->runtime_live = false;
+	KUNIT_EXPECT_PTR_EQ(test, ctx->runtime.attachment.task, NULL);
+}
+
+static void pvsched_runner_two_runtime_batched_close_test(struct kunit *test)
+{
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_runner_test_ctx *first;
+	struct pvsched_runner_test_ctx *second;
+
+	first = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!first)
+		return;
+	second = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!second)
+		return;
+	guest.cs_state = cpu_to_le64(PVSCHED_CS_NMI);
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&first->runtime,
+		PVSCHED_RECONCILE_RUN_ENTER, &guest), 0);
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&second->runtime,
+		PVSCHED_RECONCILE_RUN_ENTER, &guest), 0);
+	pvsched_runner_expect_state(test, first->task, SCHED_FIFO, 5, 60);
+	pvsched_runner_expect_state(test, second->task, SCHED_FIFO, 5, 60);
+
+	/* Final close disables and unhashes every runtime before one shared drain. */
+	pvsched_runner_runtime_disable(&first->runtime);
+	pvsched_runner_runtime_disable(&second->runtime);
+	KUNIT_EXPECT_FALSE(test, first->runtime.attachment.active);
+	KUNIT_EXPECT_FALSE(test, second->runtime.attachment.active);
+	pvsched_runner_runtime_drain_actions(&first->runtime);
+	pvsched_runner_runtime_drain_actions(&second->runtime);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_runtime_finish_close(&first->runtime,
+			true), PVSCHED_RESTORE_RESTORED);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_runtime_finish_close(&second->runtime,
+			true), PVSCHED_RESTORE_RESTORED);
+	pvsched_runner_runtime_unhash(&first->runtime);
+	pvsched_runner_runtime_unhash(&second->runtime);
+	KUNIT_EXPECT_FALSE(test, first->runtime.attachment.task_hashed);
+	KUNIT_EXPECT_FALSE(test, second->runtime.attachment.task_hashed);
+	pvsched_runner_expect_state(test, first->task, SCHED_NORMAL, 5, 0);
+	pvsched_runner_expect_state(test, second->task, SCHED_NORMAL, 5, 0);
+	pvsched_attachment_drain();
+	pvsched_runner_runtime_release(&first->runtime);
+	pvsched_runner_runtime_release(&second->runtime);
+	first->runtime_live = false;
+	second->runtime_live = false;
+	KUNIT_EXPECT_PTR_EQ(test, first->runtime.attachment.task, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, second->runtime.attachment.task, NULL);
+}
+
+static void pvsched_runner_init_abort_test(struct kunit *test)
+{
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_runner_test_ctx *ctx;
+	struct pvsched_runner_runtime failed;
+	int ret;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	KUNIT_ASSERT_EQ(test, pvsched_runner_runtime_prepare(&failed, ctx->task,
+		pvsched_runner_test_entry, NSEC_PER_SEC, NSEC_PER_SEC,
+		&ctx->ticket_owner, true), 0);
+	ret = pvsched_runner_runtime_publish(&failed, NULL, NULL);
+	KUNIT_EXPECT_EQ(test, ret, -EEXIST);
+	KUNIT_EXPECT_FALSE(test, failed.attachment.task_hashed);
+	pvsched_runner_runtime_release(&failed);
+	KUNIT_EXPECT_PTR_EQ(test, failed.attachment.task, NULL);
+	KUNIT_EXPECT_TRUE(test, ctx->runtime.attachment.task_hashed);
+	KUNIT_EXPECT_TRUE(test, ctx->runtime.attachment.active);
+	guest.cs_state = cpu_to_le64(PVSCHED_CS_NMI);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+		PVSCHED_RECONCILE_RUN_ENTER, &guest), 0);
+}
+
+static void pvsched_runner_post_insert_abort_test(struct kunit *test)
+{
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_runner_test_ctx *ctx;
+	struct pvsched_runner_test_state *state = test->priv;
+	struct pvsched_runner_runtime failed;
+	int ret;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	kunit_activate_static_stub(test, pvsched_attachment_drain,
+				   pvsched_runner_test_drain);
+	kunit_activate_static_stub(test, pvsched_attachment_owner_snapshot,
+				   pvsched_runner_test_owner_exiting);
+	ret = pvsched_runner_runtime_prepare(&failed, current,
+		pvsched_runner_test_entry, NSEC_PER_SEC, NSEC_PER_SEC,
+		&ctx->ticket_owner, true);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	ret = pvsched_runner_runtime_publish(&failed, NULL, NULL);
+	KUNIT_EXPECT_EQ(test, ret, -ESRCH);
+	KUNIT_EXPECT_EQ(test, state->drain_calls, 1U);
+	KUNIT_EXPECT_FALSE(test, failed.attachment.task_hashed);
+	KUNIT_EXPECT_FALSE(test, failed.attachment.vcpu_hashed);
+	pvsched_runner_runtime_release(&failed);
+	KUNIT_EXPECT_PTR_EQ(test, failed.attachment.task, NULL);
+	KUNIT_EXPECT_TRUE(test, ctx->runtime.attachment.task_hashed);
+	KUNIT_EXPECT_TRUE(test, ctx->runtime.attachment.active);
+	guest.cs_state = cpu_to_le64(PVSCHED_CS_NMI);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+		PVSCHED_RECONCILE_RUN_ENTER, &guest), 0);
+}
+
+static void pvsched_runner_binding_mismatch_cleanup_test(struct kunit *test)
+{
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_runner_event_input input = {
+		.guest = &guest,
+	};
+	struct pvsched_runner_test_ctx *ctx;
+	int first_key, replacement_key;
+	int ret;
+	u32 setters;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	guest.cs_state = cpu_to_le64(PVSCHED_CS_NMI);
+	ret = pvsched_runner_test_local_reconcile(ctx, &first_key,
+					  PVSCHED_RECONCILE_RUN_ENTER, &input);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	pvsched_runner_expect_state(test, ctx->task, SCHED_FIFO, 5, 60);
+	setters = pvsched_runner_test_setter_calls(test);
+	ret = pvsched_runner_test_local_reconcile(ctx, &replacement_key,
+					  PVSCHED_RECONCILE_CANCEL, &input);
+	KUNIT_EXPECT_EQ(test, ret, -ESTALE);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters + 1);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.restore_owed_error, 0);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.last_fault, 0);
+	pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, 5, 0);
+	ret = pvsched_runner_test_local_reconcile(ctx, &first_key,
+					  PVSCHED_RECONCILE_CANCEL, &input);
+	KUNIT_EXPECT_EQ(test, ret, -ESHUTDOWN);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters + 1);
+}
+
+static void pvsched_runner_binding_mismatch_vmentry_defers_test(struct kunit *test)
+{
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_runner_vmentry_input entry = { };
+	struct pvsched_runner_event_input input = { .guest = &guest };
+	struct pvsched_host_area host = { };
+	struct pvsched_runner_test_ctx *ctx;
+	int first_key, replacement_key;
+	int ret;
+	u32 setters;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	guest.cs_state = cpu_to_le64(PVSCHED_CS_NMI);
+	ret = pvsched_runner_test_local_reconcile(ctx, &first_key,
+					  PVSCHED_RECONCILE_RUN_ENTER, &input);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	setters = pvsched_runner_test_setter_calls(test);
+	ret = pvsched_runner_test_local_vmentry(ctx, &replacement_key, &entry,
+					&host);
+	KUNIT_EXPECT_EQ(test, ret, -ESTALE);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.restore_owed_error, -ESTALE);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters);
+	ret = pvsched_runner_test_local_reconcile(ctx, &first_key,
+					  PVSCHED_RECONCILE_CANCEL, &input);
+	KUNIT_EXPECT_EQ(test, ret, -ESTALE);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.restore_owed_error, 0);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters + 1);
 	pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, 5, 0);
 }
 
@@ -1818,8 +2128,8 @@ static void pvsched_runner_policy_capture_errors_test(struct kunit *test)
 		return;
 	for (i = 0; i < ARRAY_SIZE(errors); i++) {
 		state->capture_error = errors[i];
-		KUNIT_EXPECT_EQ(test, pvsched_runner_runtime_init(&failed,
-				ctx->task, 1, pvsched_runner_test_entry,
+		KUNIT_EXPECT_EQ(test, pvsched_runner_runtime_prepare(&failed,
+				ctx->task, pvsched_runner_test_entry,
 				NSEC_PER_SEC, NSEC_PER_SEC, &ctx->ticket_owner,
 				true), -EOPNOTSUPP);
 		KUNIT_EXPECT_PTR_EQ(test, failed.attachment.task, NULL);
@@ -2002,6 +2312,12 @@ static struct kunit_case pvsched_runner_runtime_test_cases[] = {
 	KUNIT_CASE(pvsched_runner_missing_guest_is_event_error_test),
 	KUNIT_CASE(pvsched_runner_revocation_skips_accounting_test),
 	KUNIT_CASE(pvsched_runner_closing_services_deferred_restore_test),
+	KUNIT_CASE(pvsched_runner_split_close_test),
+	KUNIT_CASE(pvsched_runner_two_runtime_batched_close_test),
+	KUNIT_CASE(pvsched_runner_init_abort_test),
+	KUNIT_CASE(pvsched_runner_post_insert_abort_test),
+	KUNIT_CASE(pvsched_runner_binding_mismatch_cleanup_test),
+	KUNIT_CASE(pvsched_runner_binding_mismatch_vmentry_defers_test),
 	KUNIT_CASE(pvsched_runner_unsupported_run_leave_test),
 	KUNIT_CASE(pvsched_runner_halt_not_ready_test),
 	KUNIT_CASE(pvsched_runner_unhalt_does_not_freshly_boost_test),
