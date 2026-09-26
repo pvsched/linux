@@ -268,7 +268,29 @@ static void pvsched_deactivate_locked(struct pvsched_runner_runtime *runtime)
 	pvsched_reset_host_initiated_boost_locked(runtime);
 }
 
-static int pvsched_fail_locked(struct pvsched_runner_runtime *runtime, int ret)
+/*
+ * An owned restore failed: ordinary checkpoints must not retry it, so it is
+ * terminal until teardown.  @report logs it even for the built-in default,
+ * whose other sites already WARN.
+ */
+static void
+pvsched_restore_failed_locked(struct pvsched_runner_runtime *runtime,
+			      bool report, int error)
+{
+	struct sched_task_state observed;
+
+	runtime->restore_failed = true;
+	runtime->last_fault = error;
+	if (!report && pvsched_policy_builtin(runtime->ops))
+		return;
+	sched_get_task_state(runtime->attachment.task, &observed);
+	pvsched_policy_log(runtime, "restore failed, applied class %u still in place: observed policy=%u nice=%d rt_priority=%u error=%d\n",
+			   runtime->applied_class, observed.policy,
+			   observed.nice, observed.rt_priority, error);
+}
+
+static int
+pvsched_fail_locked(struct pvsched_runner_runtime *runtime, int ret)
 {
 	int restore_ret;
 
@@ -285,10 +307,38 @@ static int pvsched_fail_locked(struct pvsched_runner_runtime *runtime, int ret)
 		return ret;
 	if (restore_ret) {
 		pvsched_policy_bug_on(runtime, true);
-		runtime->restore_failed = true;
-		runtime->last_fault = restore_ret;
+		pvsched_restore_failed_locked(runtime, true, restore_ret);
 	}
 	return ret;
+}
+
+static int
+pvsched_request_fail_locked(struct pvsched_runner_runtime *runtime,
+			    enum pvsched_boost_class requested, int error)
+{
+	int restore_ret;
+
+	hrtimer_try_to_cancel(&runtime->cutoff_timer);
+	pvsched_reset_host_initiated_boost_locked(runtime);
+	restore_ret = pvsched_restore_locked(runtime);
+	if (restore_ret) {
+		pvsched_attachment_disable_locked(&runtime->attachment);
+		if (restore_ret != -EOWNERDEAD) {
+			pvsched_policy_bug_on(runtime, true);
+			pvsched_restore_failed_locked(runtime, true,
+						      restore_ret);
+		}
+		return error;
+	}
+
+	/* The rejected request never owned an interval; resume from baseline. */
+	WARN_ON_ONCE(pvsched_runtime_commit(&runtime->accounting,
+					   PVSCHED_BUDGET_REFILL, NULL));
+	runtime->last_fault = error;
+	pvsched_policy_bug_on(runtime, true);
+	pvsched_policy_log(runtime, "rejected a class %u request: %d\n",
+			   requested, error);
+	return error;
 }
 
 /*
@@ -328,8 +378,8 @@ static int pvsched_runner_policy_bind(struct pvsched_runner_runtime *runtime,
 	return 0;
 }
 
-int pvsched_runner_runtime_init(struct pvsched_runner_runtime *runtime,
-				struct task_struct *task, u64 generation,
+int pvsched_runner_runtime_prepare(struct pvsched_runner_runtime *runtime,
+				struct task_struct *task,
 				struct pvsched_policy_entry *entry,
 				u64 cs_budget_ns, u64 generic_budget_ns,
 				struct pvsched_ticket_owner *ticket_owner,
@@ -348,54 +398,88 @@ int pvsched_runner_runtime_init(struct pvsched_runner_runtime *runtime,
 	runtime->ticket_owner = ticket_owner;
 	runtime->deboost_notify = deboost_notify;
 	ret = pvsched_runner_policy_bind(runtime, entry);
-	if (ret) {
-		/* Nothing is applied or visible yet: release, do not close. */
-		pvsched_runner_runtime_release(runtime);
-		return ret;
-	}
+	if (ret)
+		goto err_put;
 	ret = pvsched_runtime_accounting_init(&runtime->accounting, cs_budget_ns,
 					      generic_budget_ns, ktime_get_ns());
 	if (ret)
 		goto err_put;
-	ret = pvsched_attachment_publish(&runtime->attachment, NULL, NULL);
-	if (!ret)
-		return 0;
+	return 0;
 
 err_put:
-	pvsched_runner_runtime_abort(runtime);
+	pvsched_runner_runtime_release(runtime);
 	return ret;
 }
-EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_init);
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_prepare);
 
-void pvsched_runner_runtime_gate(struct pvsched_runner_runtime *runtime)
+int pvsched_runner_runtime_publish(struct pvsched_runner_runtime *runtime,
+				   pvsched_attachment_commit_fn commit, void *data)
 {
+	return pvsched_attachment_publish(&runtime->attachment, commit, data);
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_publish);
+
+/**
+ * pvsched_runner_runtime_disable() - begin one-way runtime close
+ * @runtime: runtime whose open interval and admission must be closed
+ *
+ * Settles the open accounting interval once, marks the runtime closing and
+ * disables attachment admission. A disabled runtime is never reopened.
+ */
+void pvsched_runner_runtime_disable(struct pvsched_runner_runtime *runtime)
+{
+	struct pvsched_runtime_sample sample;
 	unsigned long flags;
+	int ret;
 
 	raw_spin_lock_irqsave(&runtime->attachment.state_lock, flags);
+	if (!runtime->closing) {
+		sample = pvsched_sample(runtime, true);
+		ret = pvsched_runtime_guest_close(&runtime->accounting, sample);
+		WARN_ON_ONCE(ret);
+	}
 	runtime->closing = true;
 	pvsched_attachment_disable_locked(&runtime->attachment);
 	raw_spin_unlock_irqrestore(&runtime->attachment.state_lock, flags);
 }
-EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_gate);
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_disable);
 
-void pvsched_runner_runtime_finish_close(struct pvsched_runner_runtime *runtime)
+void pvsched_runner_runtime_drain_actions(struct pvsched_runner_runtime *runtime)
+{
+	WARN_ON_ONCE(!runtime->closing);
+	hrtimer_cancel(&runtime->cutoff_timer);
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_drain_actions);
+
+enum pvsched_runner_restore_disposition
+pvsched_runner_runtime_finish_close(struct pvsched_runner_runtime *runtime,
+				    bool final_attempt)
 {
 	unsigned long flags;
+	enum pvsched_runner_restore_disposition disposition = PVSCHED_RESTORE_RESTORED;
 	int ret;
 
 	/* Admission must be disabled before synchronously waiting for callbacks. */
 	WARN_ON_ONCE(!runtime->closing);
-	hrtimer_cancel(&runtime->cutoff_timer);
 
 	raw_spin_lock_irqsave(&runtime->attachment.state_lock, flags);
 	/* sched_process_exit makes scheduler restoration both unsafe and moot. */
-	if (!runtime->attachment.exited) {
-		runtime->attachment.restore_owed = false;
+	if (runtime->attachment.exited) {
+		disposition = PVSCHED_RESTORE_EXITED;
+	} else if (!pvsched_policy_owned(runtime)) {
+		disposition = PVSCHED_RESTORE_EXTERNAL_OWNER;
+	} else if (runtime->restore_failed && !final_attempt) {
+		disposition = PVSCHED_RESTORE_OWNED_FAILURE;
+	} else {
+		runtime->restore_owed_error = 0;
 		if (!pvsched_baseline_applied(runtime)) {
 			ret = pvsched_restore_locked(runtime);
-			if (ret && ret != -EOWNERDEAD) {
-				/* Activation wiring must copy this fault to persistent state. */
+			if (ret == -EOWNERDEAD) {
+				disposition = PVSCHED_RESTORE_EXTERNAL_OWNER;
+			} else if (ret) {
 				runtime->last_fault = ret;
+				runtime->restore_failed = true;
+				disposition = PVSCHED_RESTORE_OWNED_FAILURE;
 				pvsched_policy_log(runtime,
 						   "failed to restore during teardown: %d\n",
 						   ret);
@@ -403,9 +487,15 @@ void pvsched_runner_runtime_finish_close(struct pvsched_runner_runtime *runtime)
 		}
 	}
 	raw_spin_unlock_irqrestore(&runtime->attachment.state_lock, flags);
-	pvsched_attachment_unhash(&runtime->attachment);
+	return disposition;
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_finish_close);
+
+void pvsched_runner_runtime_unhash(struct pvsched_runner_runtime *runtime)
+{
+	pvsched_attachment_unhash(&runtime->attachment);
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_unhash);
 
 void pvsched_runner_runtime_release(struct pvsched_runner_runtime *runtime)
 {
@@ -420,24 +510,6 @@ void pvsched_runner_runtime_release(struct pvsched_runner_runtime *runtime)
 	}
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_release);
-
-void pvsched_runner_runtime_destroy(struct pvsched_runner_runtime *runtime)
-{
-	pvsched_runner_runtime_abort(runtime);
-}
-EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_destroy);
-
-void pvsched_runner_runtime_abort(struct pvsched_runner_runtime *runtime)
-{
-	bool hashed = runtime->attachment.task_hashed ||
-		      runtime->attachment.vcpu_hashed;
-
-	pvsched_runner_runtime_gate(runtime);
-	pvsched_runner_runtime_finish_close(runtime);
-	if (hashed)
-		pvsched_attachment_drain();
-	pvsched_runner_runtime_release(runtime);
-}
 
 /* A guest ack of the live ticket retires it. */
 static void
@@ -497,10 +569,8 @@ pvsched_runner_reconcile_locked(struct pvsched_runner_runtime *runtime,
 		runtime->restore_owed_error = 0;
 		hrtimer_try_to_cancel(&runtime->cutoff_timer);
 		ret = pvsched_restore_locked(runtime);
-		if (pvsched_policy_bug_on(runtime, ret && ret != -EOWNERDEAD)) {
-			runtime->restore_failed = true;
-			runtime->last_fault = ret;
-		}
+		if (pvsched_policy_bug_on(runtime, ret && ret != -EOWNERDEAD))
+			pvsched_restore_failed_locked(runtime, false, ret);
 		ret = deferred_fault;
 		goto out;
 	}
@@ -564,10 +634,8 @@ pvsched_runner_reconcile_locked(struct pvsched_runner_runtime *runtime,
 		pvsched_deactivate_locked(runtime);
 		ret = pvsched_restore_locked(runtime);
 		runtime->revoke_pending = false;
-		if (pvsched_policy_bug_on(runtime, ret && ret != -EOWNERDEAD)) {
-			runtime->restore_failed = true;
-			runtime->last_fault = ret;
-		}
+		if (pvsched_policy_bug_on(runtime, ret && ret != -EOWNERDEAD))
+			pvsched_restore_failed_locked(runtime, false, ret);
 		if (!ret)
 			ret = -EOPNOTSUPP;
 		goto out;
@@ -706,7 +774,7 @@ pvsched_runner_reconcile_locked(struct pvsched_runner_runtime *runtime,
 	};
 	ret = pvsched_map_locked(runtime, &map_input, &class, &idle_hold);
 	if (ret)
-		goto apply_fault;
+		goto request_fault;
 	target = runtime->out;
 	if (idle_hold && !runtime->idle_hold_end_ns)
 		runtime->idle_hold_end_ns = sample.wall_ns + runtime->idle_hold_ns;
@@ -738,8 +806,14 @@ selected:
 	goto out;
 
 apply_fault:
+	if (event == PVSCHED_RECONCILE_RUN_LEAVE) {
+		pvsched_idle_hold_reset(runtime);
+		ret = pvsched_fail_locked(runtime, ret);
+		goto out;
+	}
+request_fault:
 	pvsched_idle_hold_reset(runtime);
-	ret = pvsched_fail_locked(runtime, ret);
+	ret = pvsched_request_fail_locked(runtime, class, ret);
 	goto out;
 internal_fault:
 	pvsched_idle_hold_reset(runtime);

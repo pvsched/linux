@@ -95,10 +95,17 @@ struct pvsched_runner_runtime {
 	bool idle_holding;
 };
 
+enum pvsched_runner_restore_disposition {
+	PVSCHED_RESTORE_RESTORED,
+	PVSCHED_RESTORE_EXITED,
+	PVSCHED_RESTORE_EXTERNAL_OWNER,
+	PVSCHED_RESTORE_OWNED_FAILURE,
+};
+
 /*
  * Currently defined subset of the per-vCPU call order for activation wiring:
  *
- * ATTACH_SHM             -> pvsched_runner_runtime_init()
+ * ATTACH_SHM             -> prepare, then one final publish
  * RUN_ENTER              -> pvsched_runner_reconcile(RUN_ENTER, facts)
  * late VMENTRY, IRQ-off  -> pvsched_runner_vmentry()
  * fast re-entry          -> pvsched_runner_vmentry()
@@ -106,58 +113,50 @@ struct pvsched_runner_runtime {
  * IRQ-on VMEXIT          -> pvsched_runner_reconcile(VMEXIT)
  * VMENTRY_CANCEL         -> pvsched_runner_reconcile(CANCEL)
  * RUN_LEAVE              -> pvsched_runner_reconcile(RUN_LEAVE)
- * DETACH / final close   -> pvsched_runner_runtime_destroy()
+ * DETACH / final close   -> split disable/drain/disposition/unhash/release
  *
  * HALT, UNHALT, and INJECT are private events here; their KVM
  * adapters, remote lookup, and source-mode deferral are not wired yet.
  */
 
 /**
- * pvsched_runner_runtime_init() - create one attachment's runtime state
+ * pvsched_runner_runtime_prepare() - prepare private runtime state
  * @runtime: uninitialized per-attachment state
  * @task: vCPU thread whose scheduling state is captured and referenced
- * @generation: attachment generation for future late-callback validation
  * @entry: registry entry of the policy to bind; the runtime takes a reference
  * @cs_budget_ns: critical-section budget limit
  * @generic_budget_ns: total elevated-runtime budget limit
  * @ticket_owner: persistent runner ticket-generation state
  * @deboost_notify: publish the cooperative guest deboost hint
  *
- * Private pre-ATTACH helper used while no public transaction or SHM mapping
- * exists.  It allocates the policy's buffers, captures its baseline and
- * publishes the private attachment as its final step, and does not call the
- * scheduler setter.  Public ATTACH wiring must instead arrange its fallible
- * setup and copyout before the final publish callback.  Returns 0, -ENOMEM,
- * an accounting error, or -EOPNOTSUPP for an unsupported baseline.
- * A successful call must be paired with pvsched_runner_runtime_destroy().
+ * Allocates the policy's buffers and captures its baseline, without hash
+ * visibility or scheduling mutation.
+ * The caller performs every other fallible setup step before one final
+ * pvsched_runner_runtime_publish().  A prepared runtime that is not published
+ * must be paired with pvsched_runner_runtime_release().
  */
-int pvsched_runner_runtime_init(struct pvsched_runner_runtime *runtime,
-				struct task_struct *task, u64 generation,
-				struct pvsched_policy_entry *entry,
-				u64 cs_budget_ns, u64 generic_budget_ns,
-				struct pvsched_ticket_owner *ticket_owner,
-				bool deboost_notify);
-/**
- * pvsched_runner_runtime_destroy() - end one attachment's runtime lifetime
- * @runtime: initialized per-attachment state
- *
- * Called by DETACH or final close in sleepable task context, after lookup
- * removal and tracepoint/irq_work draining.  It may call the scheduler setter
- * for the final baseline restore.  Per-attachment state, including debt, dies
- * here.  Activation wiring must retain sticky fault state in the persistent
- * runner, including a restore failure first discovered during this call.
- *
- * The owner must first remove the runner from every lookup/binding and drain
- * tracepoint/irq_work callbacks.  This function closes admission before it
- * synchronously cancels the timer and drops the task reference.
- */
-void pvsched_runner_runtime_destroy(struct pvsched_runner_runtime *runtime);
+int pvsched_runner_runtime_prepare(struct pvsched_runner_runtime *runtime,
+				   struct task_struct *task,
+				   struct pvsched_policy_entry *entry,
+				   u64 cs_budget_ns, u64 generic_budget_ns,
+				   struct pvsched_ticket_owner *ticket_owner,
+				   bool deboost_notify);
+int pvsched_runner_runtime_publish(struct pvsched_runner_runtime *runtime,
+				   pvsched_attachment_commit_fn commit, void *data);
 /* Split close primitives permit one RCU drain for a batch of runtimes. */
-void pvsched_runner_runtime_gate(struct pvsched_runner_runtime *runtime);
-void pvsched_runner_runtime_finish_close(struct pvsched_runner_runtime *runtime);
+void pvsched_runner_runtime_disable(struct pvsched_runner_runtime *runtime);
+void pvsched_runner_runtime_drain_actions(struct pvsched_runner_runtime *runtime);
+/*
+ * Classify one baseline disposition after admission and actions are drained.
+ * Automatic cleanup passes false so a prior owned restoration failure is not
+ * retried; explicit detach and final close pass true for one last bounded
+ * attempt.  The caller decides from the disposition whether unhash is safe.
+ */
+enum pvsched_runner_restore_disposition
+pvsched_runner_runtime_finish_close(struct pvsched_runner_runtime *runtime,
+				    bool final_attempt);
+void pvsched_runner_runtime_unhash(struct pvsched_runner_runtime *runtime);
 void pvsched_runner_runtime_release(struct pvsched_runner_runtime *runtime);
-/* Roll back a failed ATTACH through the same split close lifetime rules. */
-void pvsched_runner_runtime_abort(struct pvsched_runner_runtime *runtime);
 
 /**
  * pvsched_runner_reconcile() - reconcile one factual event
