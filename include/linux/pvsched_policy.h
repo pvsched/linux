@@ -112,8 +112,8 @@ struct pvsched_map_input {
  *
  * @map, @apply and @owned run with the attachment's raw state lock held and
  * IRQs off, at run entry, the IRQ-on VM exit, a cancelled entry, halt, an
- * interrupt injection and the close and restore paths; never at the late
- * VM entry.  They must not
+ * interrupt injection (possibly from hard irq_work on the target CPU) and
+ * the close and restore paths; never at the late VM entry.  They must not
  * sleep, and @apply must not take a lock that orders before the task's
  * pi_lock or its runqueue lock.
  *
