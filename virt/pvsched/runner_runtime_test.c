@@ -1383,6 +1383,156 @@ static void pvsched_runner_split_close_test(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, ctx->runtime.attachment.task, NULL);
 }
 
+static void pvsched_runner_close_dispositions_test(struct kunit *test)
+{
+	struct pvsched_runner_test_ctx *ctx;
+	struct sched_attr external = {
+		.size = sizeof(external),
+		.sched_policy = SCHED_NORMAL,
+		.sched_nice = 10,
+	};
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	pvsched_runner_runtime_disable(&ctx->runtime);
+	pvsched_runner_runtime_drain_actions(&ctx->runtime);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_runtime_finish_close(&ctx->runtime,
+			false), PVSCHED_RESTORE_RESTORED);
+
+	ctx->runtime.attachment.exited = true;
+	KUNIT_EXPECT_EQ(test, pvsched_runner_runtime_finish_close(&ctx->runtime,
+			false), PVSCHED_RESTORE_EXITED);
+	ctx->runtime.attachment.exited = false;
+	KUNIT_ASSERT_EQ(test, sched_setattr_nocheck_nopi(ctx->task, &external), 0);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_runtime_finish_close(&ctx->runtime,
+			false), PVSCHED_RESTORE_EXTERNAL_OWNER);
+}
+
+static void pvsched_runner_owned_failure_retry_test(struct kunit *test)
+{
+	struct pvsched_runner_test_state *state = test->priv;
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_runner_test_ctx *ctx;
+	u32 setters;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	guest.cs_state = cpu_to_le64(PVSCHED_CS_NMI);
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+		PVSCHED_RECONCILE_RUN_ENTER, &guest), 0);
+	guest.cs_state = 0;
+	guest.task_intent.current_task.nice = -5;
+	state->fail_setter_calls = 2;
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+		PVSCHED_RECONCILE_CANCEL, &guest), -EIO);
+	KUNIT_ASSERT_TRUE(test, ctx->runtime.restore_failed);
+	pvsched_runner_runtime_disable(&ctx->runtime);
+	pvsched_runner_runtime_drain_actions(&ctx->runtime);
+	setters = state->setter_calls;
+	KUNIT_EXPECT_EQ(test, pvsched_runner_runtime_finish_close(&ctx->runtime,
+			false), PVSCHED_RESTORE_OWNED_FAILURE);
+	KUNIT_EXPECT_EQ(test, state->setter_calls, setters);
+	state->fail_setter_calls = 1;
+	KUNIT_EXPECT_EQ(test, pvsched_runner_runtime_finish_close(&ctx->runtime,
+			true), PVSCHED_RESTORE_OWNED_FAILURE);
+	KUNIT_EXPECT_EQ(test, state->setter_calls, setters + 1);
+}
+
+static void pvsched_runner_request_failure_recovers_test(struct kunit *test)
+{
+	struct pvsched_runner_test_state *state = test->priv;
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_runner_test_ctx *ctx;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	guest.task_intent.current_task.nice = -5;
+	state->fail_setter_calls = 1;
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+		PVSCHED_RECONCILE_RUN_ENTER, &guest), -EIO);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.last_fault, -EIO);
+	KUNIT_EXPECT_FALSE(test, ctx->runtime.restore_failed);
+	KUNIT_EXPECT_TRUE(test, ctx->runtime.attachment.active);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.accounting.domain,
+			PVSCHED_BUDGET_REFILL);
+	pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, 5, 0);
+
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+		PVSCHED_RECONCILE_CANCEL, &guest), 0);
+	KUNIT_EXPECT_TRUE(test, ctx->runtime.attachment.active);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.last_fault, -EIO);
+	pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, -5, 0);
+
+	state->fail_setter_calls = 1;
+	guest.task_intent.current_task.nice = -10;
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+		PVSCHED_RECONCILE_CANCEL, &guest), -EIO);
+	KUNIT_EXPECT_TRUE(test, ctx->runtime.attachment.active);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.last_fault, -EIO);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.accounting.domain,
+			PVSCHED_BUDGET_REFILL);
+	pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, 5, 0);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.applied_class, PVSCHED_CLASS_BASELINE);
+	guest.task_intent.current_task.nice = 0;
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+		PVSCHED_RECONCILE_CANCEL, &guest), 0);
+	KUNIT_EXPECT_TRUE(test, ctx->runtime.attachment.active);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.last_fault, -EIO);
+	pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, 0, 0);
+}
+
+static void pvsched_runner_request_restore_failure_gates_test(struct kunit *test)
+{
+	struct pvsched_runner_test_state *state = test->priv;
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_runner_test_ctx *ctx;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	guest.cs_state = cpu_to_le64(PVSCHED_CS_NMI);
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+		PVSCHED_RECONCILE_RUN_ENTER, &guest), 0);
+	pvsched_runner_expect_state(test, ctx->task, SCHED_FIFO, 5, 60);
+	guest.cs_state = 0;
+	guest.task_intent.current_task.nice = -5;
+	state->fail_setter_calls = 2;
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+		PVSCHED_RECONCILE_CANCEL, &guest), -EIO);
+	KUNIT_EXPECT_FALSE(test, ctx->runtime.attachment.active);
+	KUNIT_EXPECT_TRUE(test, ctx->runtime.restore_failed);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.last_fault, -EIO);
+}
+
+static void pvsched_runner_gate_closes_accounting_test(struct kunit *test)
+{
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_runner_test_ctx *ctx;
+	struct pvsched_runtime_accounting closed;
+	u64 wall_anchor;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+		PVSCHED_RECONCILE_RUN_ENTER, &guest), 0);
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_guest_start(&ctx->runtime), 0);
+	KUNIT_ASSERT_EQ(test, ctx->runtime.accounting.phase,
+			PVSCHED_RUNTIME_GUEST);
+	wall_anchor = ctx->runtime.accounting.anchor.wall_ns;
+	pvsched_runner_runtime_disable(&ctx->runtime);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.accounting.phase,
+			PVSCHED_RUNTIME_HOST);
+	KUNIT_EXPECT_GE(test, ctx->runtime.accounting.anchor.wall_ns, wall_anchor);
+	closed = ctx->runtime.accounting;
+	pvsched_runner_runtime_disable(&ctx->runtime);
+	KUNIT_EXPECT_MEMEQ(test, &ctx->runtime.accounting, &closed,
+			   sizeof(closed));
+}
+
 static void pvsched_runner_two_runtime_batched_close_test(struct kunit *test)
 {
 	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
@@ -2114,6 +2264,95 @@ static void pvsched_runner_policy_kick_by_class_test(struct kunit *test)
 		&ctx->runtime.cutoff_timer), ktime_get()), 0);
 }
 
+/* Elevate to guest nice -5, so that a fault has something to restore. */
+static void pvsched_runner_policy_elevate(struct kunit *test,
+					  struct pvsched_runner_test_ctx *ctx,
+					  struct pvsched_default_guest_area *guest)
+{
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+		PVSCHED_RECONCILE_CANCEL, guest), 0);
+	pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, -5, 0);
+}
+
+/*
+ * A map error, a class the budgets forbid, an unknown class or flag, and a
+ * hold that was not offered each restore the baseline and keep service.
+ */
+static void pvsched_runner_policy_request_faults_test(struct kunit *test)
+{
+	struct pvsched_runner_test_state *state = test->priv;
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_budget *cs, *generic;
+	struct pvsched_runner_test_ctx *ctx;
+	static const struct {
+		int map_error;
+		int apply_error;
+		int force_class;
+		u32 force_flags;
+		bool cs_throttled;
+		bool generic_throttled;
+		int error;
+	} cases[] = {
+		{ -ENOSPC, 0, -1, 0, false, false, -ENOSPC },
+		{ 0, 0, PVSCHED_CLASS_CS, 0, true, false, -EINVAL },
+		{ 0, 0, PVSCHED_CLASS_TASK, 0, false, true, -EINVAL },
+		{ 0, 0, PVSCHED_CLASS_CS + 1, 0, false, false, -EINVAL },
+		{ 0, 0, -1, PVSCHED_MAP_HELD, false, false, -EINVAL },
+		{ 0, 0, -1, BIT(1), false, false, -EINVAL },
+		/* Errors with a meaning of their own, or none, read as -EINVAL. */
+		{ 1, 0, -1, 0, false, false, -EINVAL },
+		{ -EPROTO, 0, -1, 0, false, false, -EINVAL },
+		{ -EOWNERDEAD, 0, -1, 0, false, false, -EINVAL },
+		{ 0, -ENOSPC, -1, 0, false, false, -ENOSPC },
+		{ 0, 1, -1, 0, false, false, -EINVAL },
+		{ 0, -EPROTO, -1, 0, false, false, -EINVAL },
+		{ 0, -EOWNERDEAD, -1, 0, false, false, -EINVAL },
+	};
+	unsigned int i;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	cs = &ctx->runtime.accounting.accounting.cs;
+	generic = &ctx->runtime.accounting.accounting.generic;
+	guest.task_intent.current_task.nice = -5;
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		pvsched_runner_policy_elevate(test, ctx, &guest);
+		/* New bytes, so that the request reaches apply. */
+		state->marker = i + 1;
+		state->map_error = cases[i].map_error;
+		state->apply_error = cases[i].apply_error;
+		state->force_class = cases[i].force_class;
+		state->force_flags = cases[i].force_flags;
+		if (cases[i].cs_throttled) {
+			cs->debt_ns = cs->limit_ns;
+			cs->throttled = true;
+		}
+		if (cases[i].generic_throttled) {
+			generic->debt_ns = generic->limit_ns;
+			generic->throttled = true;
+		}
+		KUNIT_EXPECT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+			PVSCHED_RECONCILE_CANCEL, &guest), cases[i].error);
+		KUNIT_EXPECT_EQ(test, ctx->runtime.last_fault, cases[i].error);
+		KUNIT_EXPECT_TRUE(test, ctx->runtime.attachment.active);
+		KUNIT_EXPECT_FALSE(test, ctx->runtime.restore_failed);
+		KUNIT_EXPECT_EQ(test, ctx->runtime.applied_class,
+				PVSCHED_CLASS_BASELINE);
+		KUNIT_EXPECT_EQ(test, ctx->runtime.accounting.domain,
+				PVSCHED_BUDGET_REFILL);
+		pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, 5, 0);
+		state->map_error = 0;
+		state->apply_error = 0;
+		state->force_class = -1;
+		state->force_flags = 0;
+		cs->debt_ns = 0;
+		cs->throttled = false;
+		generic->debt_ns = 0;
+		generic->throttled = false;
+	}
+}
+
 /* A capture refusal of any kind reads as the default's: not supported. */
 static void pvsched_runner_policy_capture_errors_test(struct kunit *test)
 {
@@ -2135,6 +2374,50 @@ static void pvsched_runner_policy_capture_errors_test(struct kunit *test)
 		KUNIT_EXPECT_PTR_EQ(test, failed.attachment.task, NULL);
 	}
 	state->capture_error = 0;
+}
+
+/*
+ * A hold is refused when offered unless it keeps the applied bytes, and
+ * never for a BASELINE value; either is a request fault.
+ */
+static void pvsched_runner_policy_invalid_hold_test(struct kunit *test)
+{
+	struct pvsched_runner_test_state *state = test->priv;
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_runner_test_ctx *ctx;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	ctx->runtime.idle_hold_ns = 200 * NSEC_PER_USEC;
+	guest.task_intent.current_task.nice = 5;
+
+	/* Offered while BASELINE is applied. */
+	state->force_flags = PVSCHED_MAP_HELD;
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_vmexit(ctx, &guest, true,
+							 false), -EINVAL);
+	KUNIT_EXPECT_TRUE(test, state->last_input.hold_offered);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.last_fault, -EINVAL);
+	KUNIT_EXPECT_FALSE(test, ctx->runtime.idle_holding);
+	pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, 5, 0);
+
+	/* Offered with a TASK boost applied, but other bytes held. */
+	state->force_flags = 0;
+	guest.task_intent.current_task = (struct pvsched_prio_desc) {
+		SCHED_FIFO, 0, 10 };
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_vmexit(ctx, &guest, false,
+							 false), 0);
+	KUNIT_ASSERT_EQ(test, ctx->runtime.applied_class, PVSCHED_CLASS_TASK);
+	state->force_flags = PVSCHED_MAP_HELD;
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_vmexit(ctx, &guest, true,
+							 true), -EINVAL);
+	KUNIT_EXPECT_TRUE(test, state->last_input.hold_offered);
+	KUNIT_EXPECT_FALSE(test, ctx->runtime.idle_holding);
+	KUNIT_EXPECT_TRUE(test, ctx->runtime.attachment.active);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.applied_class,
+			PVSCHED_CLASS_BASELINE);
+	pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, 5, 0);
+	state->force_flags = 0;
 }
 
 /* The built-in default policy itself, driven through reconcile. */
@@ -2251,6 +2534,35 @@ static void pvsched_runner_policy_declines_reasons_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, hrtimer_active(&ctx->runtime.cutoff_timer));
 }
 
+/* Without an ownership check, pvsched cannot see an external owner. */
+static void pvsched_runner_policy_without_owned_test(struct kunit *test)
+{
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_runner_test_ctx *ctx;
+
+	ctx = pvsched_runner_test_setup_policy(test,
+					       pvsched_runner_test_unowned_entry,
+					       5, 0, 0);
+	if (!ctx)
+		return;
+	guest.task_intent.current_task.nice = -5;
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+		PVSCHED_RECONCILE_RUN_ENTER, &guest), 0);
+	set_user_nice(ctx->task, 7);
+	guest.task_intent.current_task.nice = -3;
+	/* The next apply overrides the administrator's change. */
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+		PVSCHED_RECONCILE_CANCEL, &guest), 0);
+	pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, -3, 0);
+	KUNIT_EXPECT_TRUE(test, ctx->runtime.attachment.active);
+	/* Close restores the baseline without an ownership check too. */
+	pvsched_runner_runtime_disable(&ctx->runtime);
+	pvsched_runner_runtime_drain_actions(&ctx->runtime);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_runtime_finish_close(&ctx->runtime,
+			true), PVSCHED_RESTORE_RESTORED);
+	pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, 5, 0);
+}
+
 /* VMENTRY publishes the class of the applied value as the boost. */
 static void pvsched_runner_policy_boost_feedback_test(struct kunit *test)
 {
@@ -2313,6 +2625,11 @@ static struct kunit_case pvsched_runner_runtime_test_cases[] = {
 	KUNIT_CASE(pvsched_runner_revocation_skips_accounting_test),
 	KUNIT_CASE(pvsched_runner_closing_services_deferred_restore_test),
 	KUNIT_CASE(pvsched_runner_split_close_test),
+	KUNIT_CASE(pvsched_runner_close_dispositions_test),
+	KUNIT_CASE(pvsched_runner_owned_failure_retry_test),
+	KUNIT_CASE(pvsched_runner_request_failure_recovers_test),
+	KUNIT_CASE(pvsched_runner_request_restore_failure_gates_test),
+	KUNIT_CASE(pvsched_runner_gate_closes_accounting_test),
 	KUNIT_CASE(pvsched_runner_two_runtime_batched_close_test),
 	KUNIT_CASE(pvsched_runner_init_abort_test),
 	KUNIT_CASE(pvsched_runner_post_insert_abort_test),
@@ -2334,10 +2651,13 @@ static struct kunit_case pvsched_runner_runtime_test_cases[] = {
 	KUNIT_CASE(pvsched_runner_policy_bytes_test),
 	KUNIT_CASE(pvsched_runner_policy_class_charging_test),
 	KUNIT_CASE(pvsched_runner_policy_kick_by_class_test),
+	KUNIT_CASE(pvsched_runner_policy_request_faults_test),
 	KUNIT_CASE(pvsched_runner_policy_capture_errors_test),
+	KUNIT_CASE(pvsched_runner_policy_invalid_hold_test),
 	KUNIT_CASE(pvsched_runner_default_policy_smoke_test),
 	KUNIT_CASE(pvsched_runner_policy_idle_hold_test),
 	KUNIT_CASE(pvsched_runner_policy_declines_reasons_test),
+	KUNIT_CASE(pvsched_runner_policy_without_owned_test),
 	KUNIT_CASE(pvsched_runner_policy_boost_feedback_test),
 	{}
 };
