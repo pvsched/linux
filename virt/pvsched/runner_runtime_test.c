@@ -1507,7 +1507,36 @@ static void pvsched_runner_request_restore_failure_gates_test(struct kunit *test
 	KUNIT_EXPECT_EQ(test, ctx->runtime.last_fault, -EIO);
 }
 
-static void pvsched_runner_gate_closes_accounting_test(struct kunit *test)
+static void pvsched_runner_run_leave_failure_gates_test(struct kunit *test)
+{
+	struct pvsched_runner_test_state *state = test->priv;
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_runner_test_ctx *ctx;
+	u32 setters;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	guest.cs_state = cpu_to_le64(PVSCHED_CS_NMI);
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+		PVSCHED_RECONCILE_RUN_ENTER, &guest), 0);
+	setters = state->setter_calls;
+	state->fail_setter_calls = 1;
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+		PVSCHED_RECONCILE_RUN_LEAVE, NULL), -EIO);
+	KUNIT_EXPECT_EQ(test, state->setter_calls, setters + 1);
+	KUNIT_EXPECT_FALSE(test, ctx->runtime.attachment.active);
+	KUNIT_EXPECT_TRUE(test, ctx->runtime.restore_failed);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.last_fault, -EIO);
+	KUNIT_EXPECT_FALSE(test, hrtimer_active(&ctx->runtime.cutoff_timer));
+	KUNIT_EXPECT_EQ(test, ctx->runtime.reasons, 0UL);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.applied_class, PVSCHED_CLASS_CS);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.accounting.domain,
+			PVSCHED_BUDGET_DRAIN_CS_GENERIC);
+	pvsched_runner_expect_state(test, ctx->task, SCHED_FIFO, 5, 60);
+}
+
+static void pvsched_runner_disable_closes_accounting_test(struct kunit *test)
 {
 	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
 	struct pvsched_runner_test_ctx *ctx;
@@ -2629,7 +2658,8 @@ static struct kunit_case pvsched_runner_runtime_test_cases[] = {
 	KUNIT_CASE(pvsched_runner_owned_failure_retry_test),
 	KUNIT_CASE(pvsched_runner_request_failure_recovers_test),
 	KUNIT_CASE(pvsched_runner_request_restore_failure_gates_test),
-	KUNIT_CASE(pvsched_runner_gate_closes_accounting_test),
+	KUNIT_CASE(pvsched_runner_run_leave_failure_gates_test),
+	KUNIT_CASE(pvsched_runner_disable_closes_accounting_test),
 	KUNIT_CASE(pvsched_runner_two_runtime_batched_close_test),
 	KUNIT_CASE(pvsched_runner_init_abort_test),
 	KUNIT_CASE(pvsched_runner_post_insert_abort_test),
