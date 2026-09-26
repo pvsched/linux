@@ -1118,6 +1118,38 @@ static void pvsched_runner_position_is_target_owned_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, ctx->runtime.nested_l2);
 }
 
+static void pvsched_runner_local_inject_refused_without_mutation_test(struct kunit *test)
+{
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_runner_event_input input = {
+		.guest = &guest,
+	};
+	struct pvsched_runner_test_ctx *ctx;
+	struct pvsched_prio_desc applied;
+	unsigned long reasons;
+	u64 anchor_wall;
+	u32 setters;
+	int key;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	setters = pvsched_runner_test_setter_calls(test);
+	anchor_wall = ctx->runtime.accounting.anchor.wall_ns;
+	applied = ctx->runtime.applied;
+	reasons = ctx->runtime.reasons;
+	KUNIT_EXPECT_EQ(test, pvsched_runner_local_reconcile(&key,
+		PVSCHED_RECONCILE_INJECT, &input), -EINVAL);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.attachment.position,
+			PVSCHED_RUNNER_QEMU);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.accounting.anchor.wall_ns,
+			anchor_wall);
+	KUNIT_EXPECT_MEMEQ(test, &ctx->runtime.applied, &applied,
+			   sizeof(applied));
+	KUNIT_EXPECT_EQ(test, ctx->runtime.reasons, reasons);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters);
+}
+
 static void pvsched_runner_blocked_inject_is_record_only_test(struct kunit *test)
 {
 	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
@@ -2039,6 +2071,7 @@ static struct kunit_case pvsched_runner_runtime_test_cases[] = {
 	KUNIT_CASE(pvsched_runner_unsupported_revocation_test),
 	KUNIT_CASE(pvsched_runner_remote_unsupported_is_record_only_test),
 	KUNIT_CASE(pvsched_runner_position_is_target_owned_test),
+	KUNIT_CASE(pvsched_runner_local_inject_refused_without_mutation_test),
 	KUNIT_CASE(pvsched_runner_blocked_inject_is_record_only_test),
 	KUNIT_CASE(pvsched_runner_missing_guest_is_event_error_test),
 	KUNIT_CASE(pvsched_runner_revocation_skips_accounting_test),
