@@ -71,4 +71,10 @@ struct pvsched_session {
 	bool closing;
 };
 
+#if IS_ENABLED(CONFIG_KUNIT)
+extern const struct file_operations pvsched_fops;
+int pvsched_session_add_current_runner(struct pvsched_session *session,
+				       u64 *runner_id);
+#endif
+
 #endif /* _VIRT_PVSCHED_INTERNAL_H */
