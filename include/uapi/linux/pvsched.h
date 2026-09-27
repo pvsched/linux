@@ -51,6 +51,20 @@ struct pvsched_query_runner {
 	__aligned_u64 reserved1;
 };
 
+struct pvsched_attach_shm {
+	/* user_addr is a fixed-width user address, not a C pointer. */
+	__aligned_u64 runner_id;
+	__aligned_u64 user_addr;
+	__aligned_u64 size;
+	__u32 flags;
+	__u32 negotiation_status;
+};
+
+struct pvsched_detach_shm {
+	__aligned_u64 runner_id;
+	__aligned_u64 reserved[3];
+};
+
 /*
  * Enumerate the registered host policies: set index from 0 upwards until
  * ENOENT.  Every other input field is zero.
@@ -76,7 +90,11 @@ struct pvsched_set_policy {
 	__u32 flags;
 };
 
-/* On any ioctl error, including a late EEXIST, output is unspecified. */
+/*
+ * On any ioctl error, including a late EEXIST, output is unspecified.  The
+ * one exception is ATTACH_SHM's EPROTO: negotiation completed and was
+ * rejected, negotiation_status holds the reason, and no attachment remains.
+ */
 
 #define PVSCHED_GET_INFO \
 	_IOR(PVSCHED_IOCTL_TYPE, 0, struct pvsched_info)
@@ -84,6 +102,10 @@ struct pvsched_set_policy {
 	_IOWR(PVSCHED_IOCTL_TYPE, 1, struct pvsched_create_runner)
 #define PVSCHED_QUERY_RUNNER \
 	_IOWR(PVSCHED_IOCTL_TYPE, 2, struct pvsched_query_runner)
+#define PVSCHED_ATTACH_SHM \
+	_IOWR(PVSCHED_IOCTL_TYPE, 3, struct pvsched_attach_shm)
+#define PVSCHED_DETACH_SHM \
+	_IOW(PVSCHED_IOCTL_TYPE, 4, struct pvsched_detach_shm)
 #define PVSCHED_QUERY_POLICY \
 	_IOWR(PVSCHED_IOCTL_TYPE, 5, struct pvsched_policy_info)
 #define PVSCHED_SET_POLICY \

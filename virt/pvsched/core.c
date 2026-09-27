@@ -11,9 +11,11 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/overflow.h>
 #include <linux/pid.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/signal.h>
+#include <linux/sched/task.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
@@ -282,6 +284,94 @@ static long pvsched_query_runner(struct pvsched_session *session,
 	return copy_to_user(argp, &output, sizeof(output)) ? -EFAULT : 0;
 }
 
+static long pvsched_attach_shm(struct pvsched_session *session,
+			       void __user *argp)
+{
+	struct pvsched_attach_shm input, output;
+	struct pvsched_runner_runtime *runtime;
+	struct pvsched_attach_params params;
+	struct pvsched_vcpu_runner *runner;
+	struct task_struct *task;
+	enum pvsched_status status;
+	u64 end;
+	int ret;
+
+	if (copy_from_user(&input, argp, sizeof(input)))
+		return -EFAULT;
+	if (!input.runner_id || input.flags || input.negotiation_status ||
+	    input.size != PVSCHED_VCPU_STRIDE ||
+	    !IS_ALIGNED(input.user_addr, PVSCHED_VCPU_STRIDE) ||
+	    check_add_overflow(input.user_addr, input.size, &end))
+		return -EINVAL;
+
+	guard(mutex)(&session->lock);
+	runner = pvsched_find_runner(session, input.runner_id);
+	if (!runner)
+		return -ENOENT;
+	/* Finish requested cleanup so a revoked attachment does not linger. */
+	pvsched_runner_cleanup_once_locked(runner);
+	task = get_pid_task(runner->pid, PIDTYPE_PID);
+	if (!task)
+		return -ESRCH;
+
+	/* Authorization proved the caller owns the session's address space. */
+	params = (struct pvsched_attach_params) {
+		.user_addr = input.user_addr,
+		.entry = session->entry,
+		.cs_budget_ns = (u64)cs_budget_us * NSEC_PER_USEC,
+		.generic_budget_ns = (u64)generic_budget_us * NSEC_PER_USEC,
+		.deboost_notify = deboost_notify,
+		.idle_hold_ns = (u64)idle_hold_us * NSEC_PER_USEC,
+		.cap_ipc_lock = capable(CAP_IPC_LOCK),
+		.memlock_limit_pages = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT,
+	};
+	ret = pvsched_runner_prepare_attach_locked(runner, task, &params,
+						   &runtime, &status);
+	put_task_struct(task);
+	if (ret)
+		return ret;
+
+	/* A failed copyout undoes the preparation without any page response. */
+	output = input;
+	output.negotiation_status = status;
+	if (copy_to_user(argp, &output, sizeof(output))) {
+		pvsched_runner_discard_prepared_locked(runtime);
+		return -EFAULT;
+	}
+	if (status != PVSCHED_STATUS_ENABLED) {
+		pvsched_runner_reject_prepared_locked(runtime);
+		return -EPROTO;
+	}
+	ret = pvsched_runner_publish_prepared_locked(runner, runtime);
+	if (ret)
+		pvsched_runner_discard_prepared_locked(runtime);
+	return ret;
+}
+
+static long pvsched_detach_shm(struct pvsched_session *session,
+			       void __user *argp)
+{
+	struct pvsched_detach_shm input;
+	struct pvsched_vcpu_runner *runner;
+
+	if (copy_from_user(&input, argp, sizeof(input)))
+		return -EFAULT;
+	if (!input.runner_id || input.reserved[0] || input.reserved[1] ||
+	    input.reserved[2])
+		return -EINVAL;
+
+	guard(mutex)(&session->lock);
+	runner = pvsched_find_runner(session, input.runner_id);
+	if (!runner)
+		return -ENOENT;
+	/*
+	 * Detach completes even when the final owned restore fails; QUERY
+	 * reports that failure, and the VMM owns the thread from here on.
+	 */
+	pvsched_runner_detach_runtime_locked(runner);
+	return 0;
+}
+
 static long pvsched_ioctl(struct file *file, unsigned int cmd,
 			  unsigned long arg)
 {
@@ -298,6 +388,10 @@ static long pvsched_ioctl(struct file *file, unsigned int cmd,
 		return pvsched_create_runner(session, argp);
 	case PVSCHED_QUERY_RUNNER:
 		return pvsched_query_runner(session, argp);
+	case PVSCHED_ATTACH_SHM:
+		return pvsched_attach_shm(session, argp);
+	case PVSCHED_DETACH_SHM:
+		return pvsched_detach_shm(session, argp);
 	case PVSCHED_QUERY_POLICY:
 		return pvsched_query_policy(argp);
 	case PVSCHED_SET_POLICY:

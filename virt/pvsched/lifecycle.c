@@ -330,6 +330,12 @@ int pvsched_runner_prepare_attach_locked(struct pvsched_vcpu_runner *runner,
 		return ret;
 	}
 	runtime->idle_hold_ns = params->idle_hold_ns;
+	/* The vCPU thread must still belong to the process that owns the session. */
+	if (runtime->attachment.owner_mm != runner->session->owner_mm ||
+	    runtime->attachment.owner_tgid != runner->session->owner_tgid) {
+		ret = -ESRCH;
+		goto err_discard;
+	}
 	/*
 	 * The capture is compared here, before a page is pinned, and copied into
 	 * the runner only at publish.
@@ -343,8 +349,8 @@ int pvsched_runner_prepare_attach_locked(struct pvsched_vcpu_runner *runner,
 		goto err_discard;
 	}
 	/*
-	 * The page is guest memory in the VMM, which is the vCPU thread's own
-	 * address space; pin and charge there, whoever issued the ATTACH.
+	 * The page is guest memory in the VMM, which is the vCPU thread's (and
+	 * so the session's) address space; pin and charge it there.
 	 */
 	shm = &runtime->attachment.shm;
 	ret = pvsched_shm_prepare(shm, runtime->attachment.owner_mm,
