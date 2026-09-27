@@ -9,6 +9,16 @@ config PVSCHED
 	  interrupt-wake boundaries, but pvsched does not attach shared pages
 	  or change task scheduling.
 
+config PVSCHED_SHM_KUNIT_TEST
+	tristate "KUnit tests for pvsched shared-memory ownership" if !KUNIT_ALL_TESTS
+	depends on KUNIT && PVSCHED && SHMEM
+	default KUNIT_ALL_TESTS
+	help
+	  Test shared-page admission, charging, alias exclusion and
+	  partial-failure unwind: which mappings are admitted, the global
+	  page limit and memlock charge, refusing one physical page for
+	  two attachments, and releasing every step exactly once.
+
 config PVSCHED_POLICY_KUNIT_TEST
 	tristate "KUnit tests for the pvsched host policy registry" if !KUNIT_ALL_TESTS
 	depends on KUNIT && PVSCHED
