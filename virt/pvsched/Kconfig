@@ -4,11 +4,16 @@ config PVSCHED
 	tristate "Paravirtualized scheduling host framework"
 	depends on KVM_X86 && X86_64 && TRACEPOINTS
 	help
-	  Provide the pvsched host control device.  The current implementation
-	  creates device-owned sessions and records inactive vCPU runner
-	  identities.  x86 KVM publishes factual run, entry, exit, halt and
-	  interrupt-wake boundaries, but pvsched does not attach shared pages
-	  or change task scheduling.
+	  Provide the pvsched host control device.  A VMM registers its vCPU
+	  threads as runners and attaches each one's guest-shared page.  The
+	  built-in default policy then adjusts that vCPU thread's host
+	  scheduling from guest-published intent at x86 KVM run, entry, exit,
+	  halt and interrupt-wake boundaries, within host-configured priority
+	  and budget limits.
+
+	  Only x86-64 KVM provides the run and entry hooks pvsched needs, and
+	  the shared-page stride matches the x86 4 KiB page, so pvsched is
+	  x86-64 only.
 
 config PVSCHED_EVENT_SERVICE_KUNIT_TEST
 	tristate "KUnit tests for the pvsched production event service" if !KUNIT_ALL_TESTS
