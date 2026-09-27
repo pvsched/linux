@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #define _GNU_SOURCE
 
+#include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/pvsched.h>
@@ -88,6 +89,13 @@ static int wait_exited(int fd, uint64_t id, bool attached)
 		usleep(1000);
 	}
 	return -ETIMEDOUT;
+}
+
+static int detach_runner(int fd, uint64_t id)
+{
+	struct pvsched_detach_shm detach = { .runner_id = id };
+
+	return ioctl(fd, PVSCHED_DETACH_SHM, &detach) < 0 ? -errno : 0;
 }
 
 /* Run @child_fn in a forked child; true if it exits with status 0. */
@@ -196,6 +204,8 @@ static void test_control_plane(void)
 			 result.last_fault_errno == 0 && !result.reserved0 &&
 			 !result.reserved1,
 			 "QUERY_RUNNER initializes inactive and fault fields\n");
+	ksft_test_result(detach_runner(fd, runner_id) == 0,
+			 "DETACH_SHM of a never-attached runner succeeds\n");
 
 	/* Duplicate ownership must not mint or reset another runner. */
 	memset(&result, 0, sizeof(result));
@@ -527,6 +537,383 @@ static void test_final_close(void)
 		close(fd);
 }
 
+/* Status sentinel: shows whether the host wrote a response to the page. */
+#define PAGE_UNTOUCHED	0x77
+
+static struct pvsched_header *map_guest_page(void)
+{
+	struct pvsched_header *header;
+
+	header = mmap(NULL, PVSCHED_VCPU_STRIDE, PROT_READ | PROT_WRITE,
+		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (header == MAP_FAILED)
+		ksft_exit_fail_msg("guest page mmap failed\n");
+	return header;
+}
+
+/* Write a guest request, as a guest driver would before ATTACH. */
+static void write_request(struct pvsched_header *header, uint32_t mode)
+{
+	memset(header, 0, PVSCHED_VCPU_STRIDE);
+	header->abi_version = htole32(PVSCHED_ABI_VERSION);
+	header->policy_version = htole32(PVSCHED_DEFAULT_POLICY_VERSION);
+	strcpy(header->policy_name, PVSCHED_DEFAULT_POLICY_NAME);
+	header->protocol_id = htole32(PVSCHED_PROTOCOL_DEFAULT);
+	header->requested_mode = htole32(mode);
+	header->status = htole32(PAGE_UNTOUCHED);
+}
+
+static uint32_t page_status(struct pvsched_header *header)
+{
+	return le32toh(__atomic_load_n(&header->status, __ATOMIC_ACQUIRE));
+}
+
+static int attach_page(int fd, uint64_t id, void *page,
+		       struct pvsched_attach_shm *attach)
+{
+	memset(attach, 0, sizeof(*attach));
+	attach->runner_id = id;
+	attach->user_addr = (uintptr_t)page;
+	attach->size = PVSCHED_VCPU_STRIDE;
+	return ioctl(fd, PVSCHED_ATTACH_SHM, attach) < 0 ? -errno : 0;
+}
+
+static uint32_t runner_state(int fd, uint64_t id)
+{
+	struct pvsched_query_runner result;
+
+	return query(fd, id, &result) ? UINT32_MAX : result.state;
+}
+
+static int open_session_self(uint64_t *id)
+{
+	struct pvsched_create_runner request;
+	int fd = open("/dev/pvsched", O_RDWR | O_CLOEXEC);
+
+	if (fd < 0)
+		ksft_exit_fail_msg("shared-page session open failed\n");
+	if (create_self(fd, &request))
+		ksft_exit_fail_msg("shared-page CREATE_RUNNER failed\n");
+	*id = request.runner_id;
+	return fd;
+}
+
+static void test_attach_detach(void)
+{
+	struct pvsched_header *page = map_guest_page();
+	struct pvsched_attach_shm attach;
+	uint64_t id;
+	int fd, rc;
+
+	fd = open_session_self(&id);
+	write_request(page, PVSCHED_MODE_FRAMEWORK);
+	rc = attach_page(fd, id, page, &attach);
+	ksft_test_result(!rc && attach.negotiation_status == PVSCHED_STATUS_ENABLED &&
+			 attach.runner_id == id &&
+			 page_status(page) == PVSCHED_STATUS_ENABLED &&
+			 le32toh(page->host_abi_version) == PVSCHED_ABI_VERSION &&
+			 runner_state(fd, id) == PVSCHED_RUNNER_ACTIVE,
+			 "ATTACH_SHM enables the page and activates the runner\n");
+	rc = attach_page(fd, id, page, &attach);
+	ksft_test_result(rc == -EEXIST &&
+			 runner_state(fd, id) == PVSCHED_RUNNER_ACTIVE,
+			 "second ATTACH_SHM of an attached runner returns EEXIST\n");
+	rc = detach_runner(fd, id);
+	ksft_test_result(!rc && page_status(page) == PVSCHED_STATUS_DISABLED &&
+			 runner_state(fd, id) == PVSCHED_RUNNER_INACTIVE &&
+			 !detach_runner(fd, id),
+			 "DETACH_SHM disables the page and is idempotent\n");
+	write_request(page, PVSCHED_MODE_FRAMEWORK);
+	rc = attach_page(fd, id, page, &attach);
+	ksft_test_result(!rc && page_status(page) == PVSCHED_STATUS_ENABLED &&
+			 !detach_runner(fd, id),
+			 "a detached runner and page can be attached again\n");
+	close(fd);
+	munmap(page, PVSCHED_VCPU_STRIDE);
+}
+
+static void test_attach_reject(void)
+{
+	struct pvsched_header *page = map_guest_page();
+	struct pvsched_attach_shm attach;
+	uint64_t id;
+	int fd, rc;
+
+	fd = open_session_self(&id);
+	write_request(page, PVSCHED_MODE_POLICY);
+	rc = attach_page(fd, id, page, &attach);
+	ksft_test_result(rc == -EPROTO &&
+			 attach.negotiation_status == PVSCHED_STATUS_MODE_MISMATCH &&
+			 page_status(page) == PVSCHED_STATUS_MODE_MISMATCH &&
+			 runner_state(fd, id) == PVSCHED_RUNNER_INACTIVE,
+			 "rejected negotiation returns EPROTO with its status\n");
+	close(fd);
+	munmap(page, PVSCHED_VCPU_STRIDE);
+}
+
+static void test_attach_copyout(void)
+{
+	struct pvsched_header *page = map_guest_page();
+	struct pvsched_attach_shm *attach;
+	long page_size = sysconf(_SC_PAGESIZE);
+	uint64_t id;
+	int fd, rc;
+
+	fd = open_session_self(&id);
+	write_request(page, PVSCHED_MODE_FRAMEWORK);
+	attach = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
+		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (attach == MAP_FAILED)
+		ksft_exit_fail_msg("copyout mmap failed\n");
+	attach->runner_id = id;
+	attach->user_addr = (uintptr_t)page;
+	attach->size = PVSCHED_VCPU_STRIDE;
+	if (mprotect(attach, page_size, PROT_READ))
+		ksft_exit_fail_msg("copyout mprotect failed\n");
+	rc = ioctl(fd, PVSCHED_ATTACH_SHM, attach) < 0 ? -errno : 0;
+	ksft_test_result(rc == -EFAULT && page_status(page) == PAGE_UNTOUCHED &&
+			 runner_state(fd, id) == PVSCHED_RUNNER_INACTIVE,
+			 "ATTACH_SHM copyout failure writes no page response\n");
+	munmap(attach, page_size);
+	close(fd);
+	munmap(page, PVSCHED_VCPU_STRIDE);
+}
+
+static void test_attach_inputs(void)
+{
+	struct pvsched_header *page = map_guest_page();
+	struct pvsched_attach_shm attach, valid;
+	void *readonly, *memfd_page;
+	bool ok = true;
+	uint64_t id;
+	int fd, mfd, rc;
+
+	fd = open_session_self(&id);
+	write_request(page, PVSCHED_MODE_FRAMEWORK);
+	valid = (struct pvsched_attach_shm) {
+		.runner_id = id,
+		.user_addr = (uintptr_t)page,
+		.size = PVSCHED_VCPU_STRIDE,
+	};
+	attach = valid;
+	attach.runner_id = 0;
+	ok &= ioctl(fd, PVSCHED_ATTACH_SHM, &attach) < 0 && errno == EINVAL;
+	attach = valid;
+	attach.flags = 1;
+	ok &= ioctl(fd, PVSCHED_ATTACH_SHM, &attach) < 0 && errno == EINVAL;
+	attach = valid;
+	attach.negotiation_status = 1;
+	ok &= ioctl(fd, PVSCHED_ATTACH_SHM, &attach) < 0 && errno == EINVAL;
+	attach = valid;
+	attach.size = PVSCHED_VCPU_STRIDE * 2;
+	ok &= ioctl(fd, PVSCHED_ATTACH_SHM, &attach) < 0 && errno == EINVAL;
+	attach = valid;
+	attach.user_addr += 64;
+	ok &= ioctl(fd, PVSCHED_ATTACH_SHM, &attach) < 0 && errno == EINVAL;
+	attach = valid;
+	attach.runner_id = id + 1000;
+	ok &= ioctl(fd, PVSCHED_ATTACH_SHM, &attach) < 0 && errno == ENOENT;
+	ok &= detach_runner(fd, 0) == -EINVAL;
+	ok &= detach_runner(fd, id + 1000) == -ENOENT;
+
+	/* A page the caller cannot write is a fault. */
+	readonly = mmap(NULL, PVSCHED_VCPU_STRIDE, PROT_READ,
+			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	ok &= readonly != MAP_FAILED &&
+	      attach_page(fd, id, readonly, &attach) == -EFAULT;
+	if (readonly != MAP_FAILED)
+		munmap(readonly, PVSCHED_VCPU_STRIDE);
+	ok &= runner_state(fd, id) == PVSCHED_RUNNER_INACTIVE;
+	ksft_test_result(ok, "ATTACH_SHM and DETACH_SHM reject invalid input\n");
+
+	/* Shared memfd RAM, as a VMM's guest memory often is, is accepted. */
+	mfd = memfd_create("pvsched-guest", MFD_CLOEXEC);
+	memfd_page = MAP_FAILED;
+	if (mfd >= 0 && !ftruncate(mfd, PVSCHED_VCPU_STRIDE))
+		memfd_page = mmap(NULL, PVSCHED_VCPU_STRIDE,
+				  PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+	rc = -1;
+	if (memfd_page != MAP_FAILED) {
+		write_request(memfd_page, PVSCHED_MODE_FRAMEWORK);
+		rc = attach_page(fd, id, memfd_page, &attach);
+		rc = rc ?: (page_status(memfd_page) ==
+			    PVSCHED_STATUS_ENABLED ? 0 : -EINVAL);
+		rc = rc ?: detach_runner(fd, id);
+		munmap(memfd_page, PVSCHED_VCPU_STRIDE);
+	}
+	ksft_test_result(!rc, "ATTACH_SHM accepts a shared memfd page\n");
+	if (mfd >= 0)
+		close(mfd);
+	close(fd);
+	munmap(page, PVSCHED_VCPU_STRIDE);
+}
+
+static void test_attach_alias(void)
+{
+	struct pvsched_header *page = map_guest_page();
+	struct pvsched_header *other_page = map_guest_page();
+	struct pvsched_attach_shm attach;
+	struct parked_thread parked;
+	uint64_t id, other;
+	int fd, rc;
+
+	fd = open_session_self(&id);
+	if (create_tid(fd, park_thread(&parked), &other))
+		ksft_exit_fail_msg("second runner create failed\n");
+	write_request(page, PVSCHED_MODE_FRAMEWORK);
+	write_request(other_page, PVSCHED_MODE_FRAMEWORK);
+	rc = attach_page(fd, id, page, &attach);
+	rc = rc ?: (attach_page(fd, other, page, &attach) == -EEXIST ? 0 : -1);
+	rc = rc ?: attach_page(fd, other, other_page, &attach);
+	ksft_test_result(!rc && runner_state(fd, other) == PVSCHED_RUNNER_ACTIVE,
+			 "one guest page cannot serve two runners\n");
+	detach_runner(fd, id);
+	detach_runner(fd, other);
+	unpark_thread(&parked);
+	close(fd);
+	munmap(page, PVSCHED_VCPU_STRIDE);
+	munmap(other_page, PVSCHED_VCPU_STRIDE);
+}
+
+/*
+ * Guest RAM backed by hugepages: each vCPU page is a 4 KiB subpage of one
+ * hugepage, so two runners attach two subpages of the same hugepage.
+ */
+static void test_attach_hugetlb(void)
+{
+	const size_t huge = 2UL << 20;
+	struct pvsched_attach_shm attach;
+	struct parked_thread parked;
+	char *region, *first, *second;
+	uint64_t id, other;
+	int fd, rc;
+
+	region = mmap(NULL, huge, PROT_READ | PROT_WRITE,
+		      MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+	if (region == MAP_FAILED) {
+		ksft_test_result_skip("hugetlb pages attach (no 2 MiB hugepages: %s)\n",
+				      strerror(errno));
+		return;
+	}
+	first = region;
+	second = region + PVSCHED_VCPU_STRIDE;
+	fd = open_session_self(&id);
+	if (create_tid(fd, park_thread(&parked), &other))
+		ksft_exit_fail_msg("hugetlb runner create failed\n");
+	write_request((struct pvsched_header *)first, PVSCHED_MODE_FRAMEWORK);
+	write_request((struct pvsched_header *)second, PVSCHED_MODE_FRAMEWORK);
+	rc = attach_page(fd, id, first, &attach);
+	/* The same subpage cannot serve a second runner. */
+	rc = rc ?: (attach_page(fd, other, first, &attach) == -EEXIST ? 0 : -1);
+	rc = rc ?: attach_page(fd, other, second, &attach);
+	rc = rc ?: (page_status((struct pvsched_header *)first) ==
+		    PVSCHED_STATUS_ENABLED &&
+		    page_status((struct pvsched_header *)second) ==
+		    PVSCHED_STATUS_ENABLED ? 0 : -EINVAL);
+	ksft_test_result(!rc && !detach_runner(fd, id) &&
+			 !detach_runner(fd, other),
+			 "hugepage subpages attach separately, never twice\n");
+	unpark_thread(&parked);
+	close(fd);
+	munmap(region, huge);
+}
+
+static void test_attach_exit(void)
+{
+	struct pvsched_header *page = map_guest_page();
+	struct pvsched_attach_shm attach;
+	struct parked_thread parked;
+	uint64_t self, id;
+	int fd, rc;
+
+	fd = open_session_self(&self);
+	if (create_tid(fd, park_thread(&parked), &id))
+		ksft_exit_fail_msg("exit runner create failed\n");
+	write_request(page, PVSCHED_MODE_FRAMEWORK);
+	rc = attach_page(fd, id, page, &attach);
+	unpark_thread(&parked);
+	rc = rc ?: wait_exited(fd, id, true);
+	ksft_test_result(!rc && page_status(page) == PVSCHED_STATUS_DISABLED &&
+			 !detach_runner(fd, id),
+			 "attached runner exit disables the page\n");
+	/* The page is released: another runner can now attach it. */
+	write_request(page, PVSCHED_MODE_FRAMEWORK);
+	rc = attach_page(fd, self, page, &attach);
+	ksft_test_result(!rc && !detach_runner(fd, self),
+			 "exit cleanup releases the guest page\n");
+	close(fd);
+	munmap(page, PVSCHED_VCPU_STRIDE);
+}
+
+static void test_attach_final_close(void)
+{
+	struct pvsched_header *page = map_guest_page();
+	struct pvsched_attach_shm attach;
+	uint64_t id;
+	int fd, rc;
+
+	fd = open_session_self(&id);
+	write_request(page, PVSCHED_MODE_FRAMEWORK);
+	rc = attach_page(fd, id, page, &attach);
+	close(fd);
+	rc = rc ?: (page_status(page) == PVSCHED_STATUS_DISABLED ? 0 : -1);
+	fd = open_session_self(&id);
+	write_request(page, PVSCHED_MODE_FRAMEWORK);
+	rc = rc ?: attach_page(fd, id, page, &attach);
+	ksft_test_result(!rc, "final close disables and releases an attachment\n");
+	close(fd);
+	munmap(page, PVSCHED_VCPU_STRIDE);
+}
+
+/*
+ * Two sessions in separate processes attach and detach concurrently, so the
+ * shared probe set is registered and unregistered repeatedly under races.
+ */
+static void test_attach_two_sessions(void)
+{
+	pid_t children[2];
+	bool ok = true;
+	int i, status;
+
+	for (i = 0; i < 2; i++) {
+		children[i] = fork();
+		if (!children[i]) {
+			struct pvsched_header *page = map_guest_page();
+			struct pvsched_attach_shm attach;
+			uint64_t id;
+			int fd = open_session_self(&id), n;
+
+			for (n = 0; n < 200; n++) {
+				write_request(page, PVSCHED_MODE_FRAMEWORK);
+				if (attach_page(fd, id, page, &attach) ||
+				    page_status(page) != PVSCHED_STATUS_ENABLED ||
+				    detach_runner(fd, id))
+					_exit(1);
+			}
+			_exit(0);
+		}
+		if (children[i] < 0)
+			ksft_exit_fail_msg("two-session fork failed\n");
+	}
+	for (i = 0; i < 2; i++)
+		ok &= waitpid(children[i], &status, 0) == children[i] &&
+		      WIFEXITED(status) && !WEXITSTATUS(status);
+	ksft_test_result(ok, "two sessions race attach and detach safely\n");
+}
+
+static void test_shm(void)
+{
+	test_attach_detach();
+	test_attach_reject();
+	test_attach_copyout();
+	test_attach_inputs();
+	test_attach_alias();
+	test_attach_hugetlb();
+	test_attach_exit();
+	test_attach_final_close();
+	test_attach_two_sessions();
+}
+
 /* Hand a session to a fresh image of this test, which must be refused. */
 static int exec_fd_child(int unused)
 {
@@ -555,7 +942,7 @@ int main(int argc, char **argv)
 	if (argc == 3 && !strcmp(argv[1], "--query-fd"))
 		return info_eperm(atoi(argv[2]));
 	ksft_print_header();
-	ksft_set_plan(29);
+	ksft_set_plan(44);
 	{
 		int probe = open("/dev/pvsched", O_RDWR | O_CLOEXEC);
 
@@ -582,9 +969,10 @@ int main(int argc, char **argv)
 	test_session_quota();
 	test_global_runner_quota();
 	test_final_close();
+	test_shm();
 	ksft_test_result(original_policy == sched_getscheduler(0) &&
 			 original_nice == getpriority(PRIO_PROCESS, 0),
-			 "inactive control leaves caller scheduling unchanged\n");
+			 "control and detach leave caller scheduling unchanged\n");
 	alarm(0);
 	ksft_finished();
 }
