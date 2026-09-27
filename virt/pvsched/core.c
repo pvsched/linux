@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/atomic.h>
 #include <linux/capability.h>
 #include <linux/compat.h>
@@ -18,8 +20,52 @@
 #include <linux/user_namespace.h>
 #include <uapi/linux/pvsched.h>
 
+#include "default_policy.h"
 #include "internal.h"
 #include "lifecycle.h"
+
+/*
+ * Global built-in policy configuration: fixed at module load (or on the
+ * kernel command line when built in) and validated once at initialization.
+ */
+static unsigned int cs_rt_prio = 60;
+module_param(cs_rt_prio, uint, 0444);
+MODULE_PARM_DESC(cs_rt_prio, "SCHED_FIFO priority for guest critical sections");
+
+static unsigned int deadline_rt_prio = 50;
+module_param(deadline_rt_prio, uint, 0444);
+MODULE_PARM_DESC(deadline_rt_prio, "SCHED_FIFO priority for guest deadline tasks");
+
+static unsigned int guest_rt_cap = 50;
+module_param(guest_rt_cap, uint, 0444);
+MODULE_PARM_DESC(guest_rt_cap, "Highest SCHED_FIFO priority for guest RT tasks");
+
+static unsigned int cs_budget_us = PVSCHED_DEFAULT_CS_BUDGET_NS / NSEC_PER_USEC;
+module_param(cs_budget_us, uint, 0444);
+MODULE_PARM_DESC(cs_budget_us, "Critical-section boost budget in microseconds");
+
+static unsigned int generic_budget_us =
+	PVSCHED_DEFAULT_GENERIC_BUDGET_NS / NSEC_PER_USEC;
+module_param(generic_budget_us, uint, 0444);
+MODULE_PARM_DESC(generic_budget_us, "Total elevated-runtime budget in microseconds");
+
+static bool deboost_notify = true;
+module_param(deboost_notify, bool, 0444);
+MODULE_PARM_DESC(deboost_notify, "Ask guests to kick the host after a deboost");
+
+static unsigned int idle_hold_us = 200;
+module_param(idle_hold_us, uint, 0444);
+MODULE_PARM_DESC(idle_hold_us,
+		 "Longest boost kept for an idle guest on its way to a halt, in microseconds (at most cs_budget_us; 0: off)");
+
+static struct pvsched_default_policy_config pvsched_policy_config(void)
+{
+	return (struct pvsched_default_policy_config) {
+		.cs_rt_prio = cs_rt_prio,
+		.deadline_rt_prio = deadline_rt_prio,
+		.guest_rt_cap = guest_rt_cap,
+	};
+}
 
 static DEFINE_SPINLOCK(pvsched_global_lock);
 static DEFINE_HASHTABLE(pvsched_runner_hash, 14);
@@ -308,7 +354,25 @@ static struct miscdevice pvsched_device = {
 	.mode = 0600,
 };
 
-module_misc_device(pvsched_device);
+static int __init pvsched_init(void)
+{
+	struct pvsched_default_policy_config config = pvsched_policy_config();
+
+	/* Refuse to load with an invalid configuration; never clamp it. */
+	if (!pvsched_default_policy_config_valid(&config) ||
+	    !cs_budget_us || !generic_budget_us || idle_hold_us > cs_budget_us) {
+		pr_err("invalid policy configuration\n");
+		return -EINVAL;
+	}
+	return misc_register(&pvsched_device);
+}
+module_init(pvsched_init);
+
+static void __exit pvsched_exit(void)
+{
+	misc_deregister(&pvsched_device);
+}
+module_exit(pvsched_exit);
 
 MODULE_DESCRIPTION("Paravirtualized scheduling host framework");
 MODULE_LICENSE("GPL");

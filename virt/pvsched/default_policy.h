@@ -24,6 +24,10 @@ struct pvsched_default_policy_result {
 	enum pvsched_default_policy_source source;
 };
 
+/* Whether @config satisfies the range and priority-ordering rules above. */
+bool
+pvsched_default_policy_config_valid(const struct pvsched_default_policy_config *config);
+
 /**
  * pvsched_default_policy_select() - select the built-in scheduling request
  * @config: host policy configuration

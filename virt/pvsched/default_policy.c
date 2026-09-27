@@ -9,7 +9,7 @@
 
 #include "default_policy.h"
 
-static bool
+bool
 pvsched_default_policy_config_valid(const struct pvsched_default_policy_config *config)
 {
 	if (!config->cs_rt_prio || config->cs_rt_prio >= MAX_RT_PRIO)
