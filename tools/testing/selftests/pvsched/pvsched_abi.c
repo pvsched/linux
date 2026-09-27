@@ -83,6 +83,17 @@ _Static_assert(offsetof(struct pvsched_default_guest_area, interrupt_ack) == 16,
 _Static_assert(offsetof(struct pvsched_default_guest_area, reserved) == 24,
 		       "guest reserved offset");
 _Static_assert(sizeof(struct pvsched_host_area) == 64, "host area size");
+_Static_assert(sizeof(struct pvsched_policy_info) == 56, "policy info size");
+_Static_assert(offsetof(struct pvsched_policy_info, name) == 8,
+		       "policy info name offset");
+_Static_assert(offsetof(struct pvsched_policy_info, version) == 40,
+		       "policy info version offset");
+_Static_assert(offsetof(struct pvsched_policy_info, reserved) == 52,
+		       "policy info reserved offset");
+_Static_assert(sizeof(struct pvsched_set_policy) == 40, "set policy size");
+_Static_assert(offsetof(struct pvsched_set_policy, version) == 32,
+		       "set policy version offset");
+
 _Static_assert(offsetof(struct pvsched_host_area, applied_state) == 0,
 		       "applied offset");
 _Static_assert(offsetof(struct pvsched_host_area, custom) == 8,
@@ -103,6 +114,41 @@ _Static_assert(offsetof(union pvsched_vcpu_page, extension) == 192,
 		       "extension page offset");
 _Static_assert(_Alignof(union pvsched_vcpu_page) >= 8,
 		       "page alignment");
+_Static_assert(sizeof(struct pvsched_info) == 32, "info size");
+_Static_assert(offsetof(struct pvsched_info, max_shm_pages_per_session) == 20,
+		       "per-session SHM limit offset");
+_Static_assert(offsetof(struct pvsched_info, max_shm_pages_global) == 24,
+		       "global SHM limit offset");
+_Static_assert(offsetof(struct pvsched_info, reserved) == 28, "info reserved offset");
+_Static_assert(sizeof(struct pvsched_query_runner) == 32, "query size");
+_Static_assert(offsetof(struct pvsched_query_runner, runner_id) == 0,
+		       "query runner offset");
+_Static_assert(offsetof(struct pvsched_query_runner, flags) == 8,
+		       "query flags offset");
+_Static_assert(offsetof(struct pvsched_query_runner, state) == 12,
+		       "query state offset");
+_Static_assert(offsetof(struct pvsched_query_runner, last_fault_errno) == 16,
+		       "query fault offset");
+_Static_assert(offsetof(struct pvsched_query_runner, reserved0) == 20,
+		       "query reserved0 offset");
+_Static_assert(offsetof(struct pvsched_query_runner, reserved1) == 24,
+		       "query reserved1 offset");
+_Static_assert(sizeof(struct pvsched_attach_shm) == 32, "attach size");
+_Static_assert(offsetof(struct pvsched_attach_shm, runner_id) == 0,
+		       "attach runner offset");
+_Static_assert(offsetof(struct pvsched_attach_shm, user_addr) == 8,
+		       "attach address offset");
+_Static_assert(offsetof(struct pvsched_attach_shm, size) == 16,
+		       "attach size offset");
+_Static_assert(offsetof(struct pvsched_attach_shm, flags) == 24,
+		       "attach flags offset");
+_Static_assert(offsetof(struct pvsched_attach_shm, negotiation_status) == 28,
+		       "attach status offset");
+_Static_assert(sizeof(struct pvsched_detach_shm) == 32, "detach size");
+_Static_assert(offsetof(struct pvsched_detach_shm, runner_id) == 0,
+		       "detach runner offset");
+_Static_assert(offsetof(struct pvsched_detach_shm, reserved) == 8,
+		       "detach reserved offset");
 _Static_assert(PVSCHED_VCPU_STRIDE == 4096 && PVSCHED_NAME_MAX == 32 &&
 	       PVSCHED_COMMON_HEADER_SIZE == 64 &&
 	       PVSCHED_GUEST_AREA_SIZE == 64 && PVSCHED_HOST_AREA_SIZE == 64 &&
@@ -183,7 +229,7 @@ int main(void)
 	applied.boost = PVSCHED_BOOST_CS;
 
 	ksft_print_header();
-	ksft_set_plan(33);
+	ksft_set_plan(34);
 
 	check(sizeof(__le64) == sizeof(uint64_t) &&
 	      _Alignof(struct pvsched_default_guest_area) >= 8,
@@ -192,6 +238,21 @@ int main(void)
 	      offsetof(union pvsched_vcpu_page, host_area.default_area.interrupt_ticket) == 136 &&
 	      sizeof(host.default_area) == sizeof(host.custom),
 	      "default ack and ticket overlay layout");
+	check(_IOC_DIR(PVSCHED_GET_INFO) == _IOC_READ &&
+	      _IOC_SIZE(PVSCHED_GET_INFO) == sizeof(struct pvsched_info) &&
+	      _IOC_DIR(PVSCHED_QUERY_RUNNER) == (_IOC_READ | _IOC_WRITE) &&
+	      _IOC_SIZE(PVSCHED_QUERY_RUNNER) == sizeof(struct pvsched_query_runner) &&
+	      _IOC_DIR(PVSCHED_ATTACH_SHM) == (_IOC_READ | _IOC_WRITE) &&
+	      _IOC_SIZE(PVSCHED_ATTACH_SHM) == sizeof(struct pvsched_attach_shm) &&
+	      _IOC_DIR(PVSCHED_DETACH_SHM) == _IOC_WRITE &&
+	      _IOC_SIZE(PVSCHED_DETACH_SHM) == sizeof(struct pvsched_detach_shm) &&
+	      _IOC_DIR(PVSCHED_QUERY_POLICY) == (_IOC_READ | _IOC_WRITE) &&
+	      _IOC_NR(PVSCHED_QUERY_POLICY) == 5 &&
+	      _IOC_SIZE(PVSCHED_QUERY_POLICY) == sizeof(struct pvsched_policy_info) &&
+	      _IOC_DIR(PVSCHED_SET_POLICY) == _IOC_WRITE &&
+	      _IOC_NR(PVSCHED_SET_POLICY) == 6 &&
+	      _IOC_SIZE(PVSCHED_SET_POLICY) == sizeof(struct pvsched_set_policy),
+	      "control ioctl directions and sizes");
 	check(sizeof(intent) == 8 && intent.reserved == 0,
 	      "intent word and reserved bits");
 	check(PVSCHED_INTENT_FLAG_PENDING_VALID == 1,

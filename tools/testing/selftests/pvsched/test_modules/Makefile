@@ -4,6 +4,8 @@ KDIR ?= /lib/modules/$(shell uname -r)/build
 
 obj-m += pvsched-hook-observer.o
 pvsched-hook-observer-y := hook_observer.o
+obj-m += pvsched-sample-nice.o
+pvsched-sample-nice-y := sample_nice.o
 
 # Ensure that KDIR exists, otherwise skip the compilation
 modules:
