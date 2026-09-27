@@ -47,8 +47,12 @@ struct pvsched_default_priv {
 
 extern struct pvsched_policy_ops pvsched_default_policy_ops;
 
-/* The configuration of the default policy. */
+/* The module-parameter configuration of the default policy. */
 struct pvsched_default_policy_config pvsched_default_policy_get_config(void);
+
+/* Whether @config satisfies the range and priority-ordering rules above. */
+bool
+pvsched_default_policy_config_valid(const struct pvsched_default_policy_config *config);
 
 /**
  * pvsched_default_policy_select() - select the built-in scheduling request

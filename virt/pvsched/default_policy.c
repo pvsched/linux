@@ -2,6 +2,7 @@
 
 #include <linux/errno.h>
 #include <linux/export.h>
+#include <linux/moduleparam.h>
 #include <linux/sched.h>
 #include <linux/sched/prio.h>
 #include <uapi/linux/sched/types.h>
@@ -10,10 +11,21 @@
 
 #include "default_policy.h"
 
-/* The default policy's priorities; validation keeps CS the highest. */
+/*
+ * The default policy's configuration: fixed at module load (or on the
+ * kernel command line when built in) and validated once at initialization.
+ */
 static unsigned int cs_rt_prio = 60;
+module_param(cs_rt_prio, uint, 0444);
+MODULE_PARM_DESC(cs_rt_prio, "SCHED_FIFO priority for guest critical sections");
+
 static unsigned int deadline_rt_prio = 50;
+module_param(deadline_rt_prio, uint, 0444);
+MODULE_PARM_DESC(deadline_rt_prio, "SCHED_FIFO priority for guest deadline tasks");
+
 static unsigned int guest_rt_cap = 50;
+module_param(guest_rt_cap, uint, 0444);
+MODULE_PARM_DESC(guest_rt_cap, "Highest SCHED_FIFO priority for guest RT tasks");
 
 struct pvsched_default_policy_config pvsched_default_policy_get_config(void)
 {
@@ -25,7 +37,7 @@ struct pvsched_default_policy_config pvsched_default_policy_get_config(void)
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_default_policy_get_config);
 
-static bool
+bool
 pvsched_default_policy_config_valid(const struct pvsched_default_policy_config *config)
 {
 	if (!config->cs_rt_prio || config->cs_rt_prio >= MAX_RT_PRIO)
