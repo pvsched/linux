@@ -1123,6 +1123,26 @@ static void pvsched_lifecycle_prepare_failure_test(struct kunit *test)
 	pvsched_lifecycle_attach_teardown(ctx);
 }
 
+/* A vCPU thread that no longer belongs to the session owner is refused. */
+static void pvsched_lifecycle_prepare_foreign_owner_test(struct kunit *test)
+{
+	struct pvsched_lifecycle_test_ctx *ctx = pvsched_lifecycle_attach_setup(test);
+	struct pvsched_lifecycle_test_state *state = test->priv;
+	struct pvsched_runner_runtime *runtime = NULL;
+	enum pvsched_status status;
+
+	/* As if the runner thread had exec'd into a new address space. */
+	ctx->session.owner_mm = NULL;
+	mutex_lock(&ctx->session.lock);
+	KUNIT_EXPECT_EQ(test, pvsched_lifecycle_prepare_locked(ctx, &runtime,
+							       &status), -ESRCH);
+	mutex_unlock(&ctx->session.lock);
+	KUNIT_EXPECT_PTR_EQ(test, runtime, NULL);
+	KUNIT_EXPECT_EQ(test, state->unpin_calls, 0U);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(state->shm_page->header.status), 0x77U);
+	pvsched_lifecycle_attach_teardown(ctx);
+}
+
 /* Prepare and publish one ENABLED attachment on the stubbed page. */
 static struct pvsched_runner_runtime *
 pvsched_lifecycle_prepare_published(struct kunit *test,
@@ -1280,6 +1300,7 @@ static struct kunit_case pvsched_lifecycle_test_cases[] = {
 	KUNIT_CASE(pvsched_lifecycle_prepare_reject_test),
 	KUNIT_CASE(pvsched_lifecycle_prepare_discard_test),
 	KUNIT_CASE(pvsched_lifecycle_prepare_failure_test),
+	KUNIT_CASE(pvsched_lifecycle_prepare_foreign_owner_test),
 	KUNIT_CASE(pvsched_lifecycle_disabled_once_test),
 	KUNIT_CASE(pvsched_lifecycle_exit_disables_page_test),
 	KUNIT_CASE(pvsched_lifecycle_owned_failure_keeps_page_test),

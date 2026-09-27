@@ -55,3 +55,13 @@ config PVSCHED_NEGOTIATION_KUNIT_TEST
 	  rejection order (ABI, name encoding, policy, version, protocol,
 	  mode, guest fields), policy-name encoding rules and the guest
 	  fields that must be zero on a fresh attach.
+
+config PVSCHED_CONTROL_KUNIT_TEST
+	tristate "KUnit tests for pvsched shared-page control ioctls" if !KUNIT_ALL_TESTS
+	depends on KUNIT && PVSCHED && KVM && X86_64 && MMU
+	default KUNIT_ALL_TESTS
+	help
+	  Drive ATTACH_SHM and DETACH_SHM through the control device's ioctl
+	  entry with a real anonymous guest page: enabled attach, rejection,
+	  input errors, idempotent detach and final close.  The KUnit thread
+	  is registered as the runner and given its own address space.

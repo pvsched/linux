@@ -21,6 +21,7 @@
 #include <linux/uaccess.h>
 #include <linux/user_namespace.h>
 #include <uapi/linux/pvsched.h>
+#include <kunit/visibility.h>
 
 #include "default_policy.h"
 #include "internal.h"
@@ -434,13 +435,53 @@ static int pvsched_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static const struct file_operations pvsched_fops = {
+VISIBLE_IF_KUNIT const struct file_operations pvsched_fops = {
 	.owner = THIS_MODULE,
 	.open = pvsched_open,
 	.release = pvsched_release,
 	.unlocked_ioctl = pvsched_ioctl,
 	.compat_ioctl = compat_ptr_ioctl,
 };
+
+EXPORT_SYMBOL_IF_KUNIT(pvsched_fops);
+
+#if IS_ENABLED(CONFIG_KUNIT)
+/*
+ * CREATE_RUNNER cannot register a kthread, whose mm get_task_mm() refuses,
+ * so tests register the KUnit thread through the same runner bookkeeping.
+ */
+int pvsched_session_add_current_runner(struct pvsched_session *session,
+				       u64 *runner_id)
+{
+	struct pvsched_vcpu_runner *runner;
+	int ret;
+
+	runner = kzalloc_obj(*runner);
+	if (!runner)
+		return -ENOMEM;
+	guard(mutex)(&session->lock);
+	if (!atomic_add_unless(&pvsched_nr_runners, 1,
+			       PVSCHED_MAX_RUNNERS_GLOBAL)) {
+		kfree(runner);
+		return -ENOSPC;
+	}
+	runner->pid = get_task_pid(current, PIDTYPE_PID);
+	runner->runner_id = session->next_runner_id++;
+	pvsched_runner_lifecycle_init(runner, session);
+	ret = pvsched_runner_register_global(runner);
+	if (ret) {
+		put_pid(runner->pid);
+		kfree(runner);
+		atomic_dec(&pvsched_nr_runners);
+		return ret;
+	}
+	list_add_tail(&runner->session_node, &session->runners);
+	session->nr_runners++;
+	*runner_id = runner->runner_id;
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_session_add_current_runner);
+#endif
 
 static struct miscdevice pvsched_device = {
 	.minor = MISC_DYNAMIC_MINOR,
