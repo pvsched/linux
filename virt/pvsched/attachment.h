@@ -8,6 +8,8 @@
 #include <linux/sched.h>
 #include <linux/spinlock.h>
 
+#include "shm.h"
+
 /*
  * The attachment is common framework state for every policy ownership mode:
  * pinned identity, lookup hashes and binding, admission, position/mode facts,
@@ -56,6 +58,8 @@ struct pvsched_attachment {
 	 * task-hash lock under state_lock, or task_lock under either hash lock.
 	 */
 	raw_spinlock_t state_lock;
+	/* Pinned resource; the bridge accesses its stable addr under state_lock. */
+	struct pvsched_shm shm;
 	/* Exact target task pinned from private initialization to destroy. */
 	struct task_struct *task;
 	/* Address space captured at initialization for local-hook admission. */
