@@ -31,3 +31,6 @@ pvsched-shm-test-y := shm_test.o
 
 obj-$(CONFIG_PVSCHED_SHM_BRIDGE_KUNIT_TEST) += pvsched-shm-bridge-test.o
 pvsched-shm-bridge-test-y := shm_bridge_test.o
+
+obj-$(CONFIG_PVSCHED_NEGOTIATION_KUNIT_TEST) += pvsched-negotiation-test.o
+pvsched-negotiation-test-y := negotiation_test.o

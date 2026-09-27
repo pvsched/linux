@@ -3,21 +3,27 @@
 #include <kunit/test.h>
 #include <kunit/static_stub.h>
 #include <linux/completion.h>
+#include <linux/gfp.h>
 #include <linux/kthread.h>
+#include <linux/mm.h>
 #include <linux/pid.h>
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
 #include <linux/sched/task.h>
+#include <linux/string.h>
 
 #include "event_service.h"
 #include "internal.h"
 #include "lifecycle.h"
+#include "shm.h"
 
 struct pvsched_lifecycle_test_ctx {
 	struct pvsched_session session;
 	struct pvsched_vcpu_runner runner;
 	void *test_state;
+	/* The KUnit thread's address space, standing in for the VMM's. */
+	struct mm_struct *mm;
 };
 
 struct pvsched_lifecycle_test_state {
@@ -37,6 +43,11 @@ struct pvsched_lifecycle_test_state {
 	struct completion work_entered;
 	struct completion allow_work;
 	struct completion final_disabled;
+	/* Shared-page stubs for the ATTACH preparation tests. */
+	union pvsched_vcpu_page *shm_page;
+	long pin_ret;
+	u32 unpin_calls;
+	bool unpin_dirty;
 };
 
 struct pvsched_lifecycle_release_ctx {
@@ -896,7 +907,384 @@ static void pvsched_lifecycle_internal_fault_query_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, fault, -EINVAL);
 }
 
+static int pvsched_lifecycle_shm_mapping(struct mm_struct *mm,
+					 unsigned long start, unsigned long end)
+{
+	return 0;
+}
+
+static long pvsched_lifecycle_shm_pin(struct mm_struct *mm,
+				      unsigned long user_addr,
+				      struct page **page)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct pvsched_lifecycle_test_state *state = test->priv;
+
+	mmap_assert_locked(mm);
+	if (state->pin_ret == 1)
+		*page = virt_to_page(state->shm_page);
+	return state->pin_ret;
+}
+
+static void pvsched_lifecycle_shm_unpin(struct page *page, bool dirty)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct pvsched_lifecycle_test_state *state = test->priv;
+
+	state->unpin_calls++;
+	state->unpin_dirty = dirty;
+}
+
+/* A runner and session with no runtime; the page is a guest request. */
+static struct pvsched_lifecycle_test_ctx *
+pvsched_lifecycle_attach_setup(struct kunit *test)
+{
+	struct pvsched_lifecycle_test_state *state = test->priv;
+	struct pvsched_lifecycle_test_ctx *ctx;
+	struct pvsched_header *header;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	/* ATTACH pins in the vCPU thread's own mm; a KUnit kthread needs one. */
+	KUNIT_ASSERT_EQ(test, kunit_attach_mm(), 0);
+	ctx->mm = current->mm;
+	state->shm_page = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+	KUNIT_ASSERT_NOT_NULL(test, state->shm_page);
+	state->pin_ret = 1;
+	header = &state->shm_page->header;
+	header->abi_version = cpu_to_le32(PVSCHED_ABI_VERSION);
+	header->policy_version = cpu_to_le32(PVSCHED_DEFAULT_POLICY_VERSION);
+	strscpy(header->policy_name, PVSCHED_DEFAULT_POLICY_NAME,
+		sizeof(header->policy_name));
+	header->protocol_id = cpu_to_le32(PVSCHED_PROTOCOL_DEFAULT);
+	header->requested_mode = cpu_to_le32(PVSCHED_MODE_FRAMEWORK);
+	/* A sentinel shows whether the host wrote a response. */
+	header->status = cpu_to_le32(0x77);
+	mutex_init(&ctx->session.lock);
+	INIT_LIST_HEAD(&ctx->session.runners);
+	ctx->session.owner_mm = ctx->mm;
+	ctx->session.owner_tgid = task_tgid(current);
+	ctx->test_state = state;
+	ctx->runner.pid = get_task_pid(current, PIDTYPE_PID);
+	pvsched_runner_lifecycle_init(&ctx->runner, &ctx->session);
+	list_add(&ctx->runner.session_node, &ctx->session.runners);
+	kunit_activate_static_stub(test, pvsched_shm_mapping_admit,
+				   pvsched_lifecycle_shm_mapping);
+	kunit_activate_static_stub(test, pvsched_shm_pin_page,
+				   pvsched_lifecycle_shm_pin);
+	kunit_activate_static_stub(test, pvsched_shm_unpin_page,
+				   pvsched_lifecycle_shm_unpin);
+	return ctx;
+}
+
+static void pvsched_lifecycle_attach_teardown(struct pvsched_lifecycle_test_ctx *ctx)
+{
+	struct pvsched_lifecycle_test_state *state = ctx->test_state;
+
+	cancel_work_sync(&ctx->runner.cleanup_work);
+	put_pid(ctx->runner.pid);
+	free_page((unsigned long)state->shm_page);
+}
+
+/* Callers hold the session mutex until publish, reject or discard. */
+static int
+pvsched_lifecycle_prepare_locked(struct pvsched_lifecycle_test_ctx *ctx,
+				 struct pvsched_runner_runtime **runtime,
+				 enum pvsched_status *status)
+{
+	struct pvsched_default_policy_config config = pvsched_lifecycle_config();
+	struct pvsched_attach_params params = {
+		.user_addr = 0x100000,
+		.config = &config,
+		.cs_budget_ns = NSEC_PER_SEC,
+		.generic_budget_ns = NSEC_PER_SEC,
+		.deboost_notify = true,
+		.idle_hold_ns = 150 * NSEC_PER_USEC,
+		.cap_ipc_lock = true,
+	};
+
+	return pvsched_runner_prepare_attach_locked(&ctx->runner, current,
+						    &params, runtime, status);
+}
+
+static void pvsched_lifecycle_prepare_commit_test(struct kunit *test)
+{
+	struct pvsched_lifecycle_test_ctx *ctx = pvsched_lifecycle_attach_setup(test);
+	struct pvsched_lifecycle_test_state *state = test->priv;
+	union pvsched_vcpu_page *page = state->shm_page;
+	struct pvsched_runner_runtime *runtime;
+	enum pvsched_status status;
+
+	mutex_lock(&ctx->session.lock);
+	KUNIT_ASSERT_EQ(test, pvsched_lifecycle_prepare_locked(ctx, &runtime,
+							       &status), 0);
+	KUNIT_EXPECT_EQ(test, status, PVSCHED_STATUS_ENABLED);
+	/* Preparation writes nothing and publishes nothing. */
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(page->header.status), 0x77U);
+	KUNIT_EXPECT_PTR_EQ(test, ctx->runner.runtime, NULL);
+	KUNIT_EXPECT_TRUE(test, runtime->attachment.shm.service_charged);
+	/* The page is pinned in the vCPU thread's address space. */
+	KUNIT_EXPECT_PTR_EQ(test, runtime->attachment.shm.mm, ctx->mm);
+	/* The global idle-hold bound reaches the runtime. */
+	KUNIT_EXPECT_EQ(test, runtime->idle_hold_ns, 150ULL * NSEC_PER_USEC);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_publish_prepared_locked(&ctx->runner,
+			runtime), 0);
+	mutex_unlock(&ctx->session.lock);
+	KUNIT_EXPECT_PTR_EQ(test, ctx->runner.runtime, runtime);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(page->header.status),
+			(u32)PVSCHED_STATUS_ENABLED);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(page->header.host_abi_version),
+			(u32)PVSCHED_ABI_VERSION);
+
+	/* DETACH tells the guest, then releases the page exactly once. */
+	mutex_lock(&ctx->session.lock);
+	pvsched_runner_detach_runtime_locked(&ctx->runner);
+	mutex_unlock(&ctx->session.lock);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(page->header.status),
+			(u32)PVSCHED_STATUS_DISABLED);
+	KUNIT_EXPECT_EQ(test, state->unpin_calls, 1U);
+	KUNIT_EXPECT_TRUE(test, state->unpin_dirty);
+	pvsched_lifecycle_attach_teardown(ctx);
+}
+
+static void pvsched_lifecycle_prepare_reject_test(struct kunit *test)
+{
+	struct pvsched_lifecycle_test_ctx *ctx = pvsched_lifecycle_attach_setup(test);
+	struct pvsched_lifecycle_test_state *state = test->priv;
+	union pvsched_vcpu_page *page = state->shm_page;
+	struct pvsched_runner_runtime *runtime;
+	enum pvsched_status status;
+
+	page->header.requested_mode = cpu_to_le32(PVSCHED_MODE_POLICY);
+	mutex_lock(&ctx->session.lock);
+	KUNIT_ASSERT_EQ(test, pvsched_lifecycle_prepare_locked(ctx, &runtime,
+							       &status), 0);
+	KUNIT_EXPECT_EQ(test, status, PVSCHED_STATUS_MODE_MISMATCH);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(page->header.status), 0x77U);
+	pvsched_runner_reject_prepared_locked(runtime);
+	mutex_unlock(&ctx->session.lock);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(page->header.status),
+			(u32)PVSCHED_STATUS_MODE_MISMATCH);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(page->header.host_abi_version),
+			(u32)PVSCHED_ABI_VERSION);
+	KUNIT_EXPECT_EQ(test, state->unpin_calls, 1U);
+	KUNIT_EXPECT_PTR_EQ(test, ctx->runner.runtime, NULL);
+	pvsched_lifecycle_attach_teardown(ctx);
+}
+
+/* A failed copyout discards the preparation without any page response. */
+static void pvsched_lifecycle_prepare_discard_test(struct kunit *test)
+{
+	struct pvsched_lifecycle_test_ctx *ctx = pvsched_lifecycle_attach_setup(test);
+	struct pvsched_lifecycle_test_state *state = test->priv;
+	union pvsched_vcpu_page *page = state->shm_page;
+	struct pvsched_runner_runtime *runtime;
+	enum pvsched_status status;
+
+	mutex_lock(&ctx->session.lock);
+	KUNIT_ASSERT_EQ(test, pvsched_lifecycle_prepare_locked(ctx, &runtime,
+							       &status), 0);
+	pvsched_runner_discard_prepared_locked(runtime);
+	mutex_unlock(&ctx->session.lock);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(page->header.status), 0x77U);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(page->header.host_abi_version), 0U);
+	KUNIT_EXPECT_EQ(test, state->unpin_calls, 1U);
+	pvsched_lifecycle_attach_teardown(ctx);
+}
+
+static void pvsched_lifecycle_prepare_failure_test(struct kunit *test)
+{
+	struct pvsched_lifecycle_test_ctx *ctx = pvsched_lifecycle_attach_setup(test);
+	struct pvsched_lifecycle_test_state *state = test->priv;
+	struct pvsched_runner_runtime *runtime = NULL, *existing;
+	enum pvsched_status status;
+
+	/* A failed pin unwinds every charge and leaves no runtime. */
+	state->pin_ret = -EFAULT;
+	mutex_lock(&ctx->session.lock);
+	KUNIT_EXPECT_EQ(test, pvsched_lifecycle_prepare_locked(ctx, &runtime,
+							       &status), -EFAULT);
+	mutex_unlock(&ctx->session.lock);
+	KUNIT_EXPECT_PTR_EQ(test, runtime, NULL);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(state->shm_page->header.status), 0x77U);
+
+	/* An attached runner rejects a second ATTACH before any resource. */
+	state->pin_ret = 1;
+	mutex_lock(&ctx->session.lock);
+	KUNIT_ASSERT_EQ(test, pvsched_lifecycle_prepare_locked(ctx, &existing,
+							       &status), 0);
+	KUNIT_ASSERT_EQ(test, pvsched_runner_publish_prepared_locked(&ctx->runner,
+			existing), 0);
+	KUNIT_EXPECT_EQ(test, pvsched_lifecycle_prepare_locked(ctx, &runtime,
+							       &status), -EEXIST);
+	KUNIT_EXPECT_TRUE(test, existing->attachment.shm.service_charged);
+	pvsched_runner_detach_runtime_locked(&ctx->runner);
+	mutex_unlock(&ctx->session.lock);
+	pvsched_lifecycle_attach_teardown(ctx);
+}
+
+/* Prepare and publish one ENABLED attachment on the stubbed page. */
+static struct pvsched_runner_runtime *
+pvsched_lifecycle_prepare_published(struct kunit *test,
+				    struct pvsched_lifecycle_test_ctx *ctx)
+{
+	struct pvsched_runner_runtime *runtime;
+	enum pvsched_status status;
+
+	mutex_lock(&ctx->session.lock);
+	KUNIT_ASSERT_EQ(test, pvsched_lifecycle_prepare_locked(ctx, &runtime,
+							       &status), 0);
+	KUNIT_ASSERT_EQ(test, status, PVSCHED_STATUS_ENABLED);
+	KUNIT_ASSERT_EQ(test, pvsched_runner_publish_prepared_locked(&ctx->runner,
+			runtime), 0);
+	mutex_unlock(&ctx->session.lock);
+	return runtime;
+}
+
+static void pvsched_lifecycle_disabled_once_test(struct kunit *test)
+{
+	struct pvsched_lifecycle_test_ctx *ctx = pvsched_lifecycle_attach_setup(test);
+	struct pvsched_lifecycle_test_state *state = test->priv;
+	union pvsched_vcpu_page *page = state->shm_page;
+	struct pvsched_runner_runtime *runtime;
+
+	runtime = pvsched_lifecycle_prepare_published(test, ctx);
+	pvsched_attachment_disable(&runtime->attachment);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(page->header.status),
+			(u32)PVSCHED_STATUS_DISABLED);
+	/* Later disables and the close sequence must not rewrite the status. */
+	page->header.status = cpu_to_le32(0x55);
+	pvsched_attachment_disable(&runtime->attachment);
+	mutex_lock(&ctx->session.lock);
+	pvsched_runner_detach_runtime_locked(&ctx->runner);
+	mutex_unlock(&ctx->session.lock);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(page->header.status), 0x55U);
+	KUNIT_EXPECT_EQ(test, state->unpin_calls, 1U);
+	pvsched_lifecycle_attach_teardown(ctx);
+}
+
+static void pvsched_lifecycle_exit_disables_page_test(struct kunit *test)
+{
+	struct pvsched_lifecycle_test_ctx *ctx = pvsched_lifecycle_attach_setup(test);
+	struct pvsched_lifecycle_test_state *state = test->priv;
+	union pvsched_vcpu_page *page = state->shm_page;
+
+	pvsched_lifecycle_prepare_published(test, ctx);
+	/*
+	 * The page stubs redirect only this KUnit thread, so hold the cleanup
+	 * worker at entry and release the page from here instead.
+	 */
+	state->block_work = true;
+	ctx->runner.lifecycle_test_hook = pvsched_lifecycle_test_checkpoint;
+	ctx->runner.lifecycle_test_data = state;
+	KUNIT_EXPECT_TRUE(test, pvsched_attachment_mark_exited(current, NULL, NULL));
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(page->header.status),
+			(u32)PVSCHED_STATUS_DISABLED);
+	KUNIT_ASSERT_TRUE(test, wait_for_completion_timeout(&state->work_entered,
+							   5 * HZ));
+	mutex_lock(&ctx->session.lock);
+	pvsched_runner_detach_runtime_locked(&ctx->runner);
+	mutex_unlock(&ctx->session.lock);
+	complete(&state->allow_work);
+	flush_work(&ctx->runner.cleanup_work);
+	KUNIT_EXPECT_PTR_EQ(test, ctx->runner.runtime, NULL);
+	KUNIT_EXPECT_EQ(test, state->unpin_calls, 1U);
+	pvsched_lifecycle_attach_teardown(ctx);
+}
+
+static void pvsched_lifecycle_owned_failure_keeps_page_test(struct kunit *test)
+{
+	struct pvsched_lifecycle_test_ctx *ctx = pvsched_lifecycle_attach_setup(test);
+	struct pvsched_lifecycle_test_state *state = test->priv;
+	union pvsched_vcpu_page *page = state->shm_page;
+	struct pvsched_runner_runtime *runtime;
+	unsigned long flags;
+
+	runtime = pvsched_lifecycle_prepare_published(test, ctx);
+	/* A recorded owned-restore failure makes automatic cleanup retain. */
+	raw_spin_lock_irqsave(&runtime->attachment.state_lock, flags);
+	runtime->restore_failed = true;
+	pvsched_runner_request_cleanup_locked(&runtime->attachment);
+	raw_spin_unlock_irqrestore(&runtime->attachment.state_lock, flags);
+	flush_work(&ctx->runner.cleanup_work);
+	KUNIT_EXPECT_PTR_EQ(test, ctx->runner.runtime, runtime);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(page->header.status),
+			(u32)PVSCHED_STATUS_DISABLED);
+	KUNIT_EXPECT_EQ(test, state->unpin_calls, 0U);
+	KUNIT_EXPECT_TRUE(test, runtime->attachment.shm.service_charged);
+	/* An explicit DETACH releases it once. */
+	mutex_lock(&ctx->session.lock);
+	pvsched_runner_detach_runtime_locked(&ctx->runner);
+	mutex_unlock(&ctx->session.lock);
+	KUNIT_EXPECT_EQ(test, state->unpin_calls, 1U);
+	pvsched_lifecycle_attach_teardown(ctx);
+}
+
+static void pvsched_lifecycle_publish_failure_discard_test(struct kunit *test)
+{
+	struct pvsched_lifecycle_test_ctx *ctx = pvsched_lifecycle_attach_setup(test);
+	struct pvsched_lifecycle_test_state *state = test->priv;
+	union pvsched_vcpu_page *page = state->shm_page;
+	struct pvsched_runner_runtime *runtime = NULL;
+	enum pvsched_status status;
+
+	/* A changed baseline on reattach fails before any page is pinned. */
+	ctx->runner.baseline_valid = true;
+	ctx->runner.baseline.policy = SCHED_NORMAL;
+	ctx->runner.baseline.nice = 19;
+	mutex_lock(&ctx->session.lock);
+	KUNIT_EXPECT_EQ(test, pvsched_lifecycle_prepare_locked(ctx, &runtime,
+							       &status), -EBUSY);
+	mutex_unlock(&ctx->session.lock);
+	KUNIT_EXPECT_EQ(test, state->unpin_calls, 0U);
+	ctx->runner.baseline_valid = false;
+
+	/* An exit found after task-hash insertion fails publication. */
+	mutex_lock(&ctx->session.lock);
+	KUNIT_ASSERT_EQ(test, pvsched_lifecycle_prepare_locked(ctx, &runtime,
+							       &status), 0);
+	kunit_activate_static_stub(test, pvsched_attachment_owner_snapshot,
+				   pvsched_lifecycle_test_owner_exit);
+	KUNIT_EXPECT_EQ(test, pvsched_runner_publish_prepared_locked(&ctx->runner,
+			runtime), -ESRCH);
+	pvsched_runner_discard_prepared_locked(runtime);
+	mutex_unlock(&ctx->session.lock);
+	kunit_deactivate_static_stub(test, pvsched_attachment_owner_snapshot);
+	KUNIT_EXPECT_PTR_EQ(test, ctx->runner.runtime, NULL);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(page->header.status), 0x77U);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(page->header.host_abi_version), 0U);
+	KUNIT_EXPECT_EQ(test, state->unpin_calls, 1U);
+	pvsched_lifecycle_attach_teardown(ctx);
+}
+
+static void pvsched_lifecycle_final_close_releases_page_test(struct kunit *test)
+{
+	struct pvsched_lifecycle_test_ctx *ctx = pvsched_lifecycle_attach_setup(test);
+	struct pvsched_lifecycle_test_state *state = test->priv;
+	union pvsched_vcpu_page *page = state->shm_page;
+
+	pvsched_lifecycle_prepare_published(test, ctx);
+	mutex_lock(&ctx->session.lock);
+	ctx->session.closing = true;
+	mutex_unlock(&ctx->session.lock);
+	pvsched_session_release_runtimes(&ctx->session);
+	KUNIT_EXPECT_PTR_EQ(test, ctx->runner.runtime, NULL);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(page->header.status),
+			(u32)PVSCHED_STATUS_DISABLED);
+	KUNIT_EXPECT_EQ(test, state->unpin_calls, 1U);
+	pvsched_lifecycle_attach_teardown(ctx);
+}
+
 static struct kunit_case pvsched_lifecycle_test_cases[] = {
+	KUNIT_CASE(pvsched_lifecycle_prepare_commit_test),
+	KUNIT_CASE(pvsched_lifecycle_prepare_reject_test),
+	KUNIT_CASE(pvsched_lifecycle_prepare_discard_test),
+	KUNIT_CASE(pvsched_lifecycle_prepare_failure_test),
+	KUNIT_CASE(pvsched_lifecycle_disabled_once_test),
+	KUNIT_CASE(pvsched_lifecycle_exit_disables_page_test),
+	KUNIT_CASE(pvsched_lifecycle_owned_failure_keeps_page_test),
+	KUNIT_CASE(pvsched_lifecycle_publish_failure_discard_test),
+	KUNIT_CASE(pvsched_lifecycle_final_close_releases_page_test),
 	KUNIT_CASE(pvsched_lifecycle_history_reattach_test),
 	KUNIT_CASE(pvsched_lifecycle_binding_work_test),
 	KUNIT_CASE(pvsched_lifecycle_exit_work_test),
