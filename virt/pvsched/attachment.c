@@ -25,6 +25,7 @@
 
 #include "attachment.h"
 #include "lifecycle.h"
+#include "shm_bridge.h"
 
 #define PVSCHED_ATTACHMENT_HASH_BITS 8
 
@@ -322,6 +323,10 @@ EXPORT_SYMBOL_IF_KUNIT(pvsched_attachment_remote_visit);
 
 void pvsched_attachment_disable_locked(struct pvsched_attachment *attachment)
 {
+	/* Tell the guest once, when service actually stops. */
+	if (attachment->active && attachment->shm.addr)
+		pvsched_shm_bridge_publish_status(&attachment->shm,
+						  PVSCHED_STATUS_DISABLED);
 	attachment->active = false;
 }
 

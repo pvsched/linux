@@ -8,6 +8,8 @@
 #include "internal.h"
 #include "event_service.h"
 #include "lifecycle.h"
+#include "negotiation.h"
+#include "shm_bridge.h"
 
 static bool pvsched_baseline_equal(const struct sched_task_state *a,
 				   const struct sched_task_state *b)
@@ -89,6 +91,7 @@ static void pvsched_runner_free_runtime_locked(struct pvsched_vcpu_runner *runne
 	struct pvsched_runner_runtime *runtime = runner->runtime;
 
 	pvsched_event_service_put();
+	pvsched_shm_release(&runtime->attachment.shm);
 	pvsched_runner_runtime_release(runtime);
 	kfree(runtime);
 	runner->runtime = NULL;
@@ -263,3 +266,116 @@ void pvsched_runner_detach_runtime_locked(struct pvsched_vcpu_runner *runner)
 	pvsched_runner_free_runtime_locked(runner);
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_detach_runtime_locked);
+
+/*
+ * Prepare one ATTACH without making anything visible: capture the task
+ * baseline and runtime, admit and pin the shared page, and decide the
+ * negotiation from one private snapshot.  The page is not written here.
+ * The caller copies its output first, then either publishes an ENABLED
+ * preparation with pvsched_runner_publish_prepared_locked() or rejects any
+ * other with pvsched_runner_reject_prepared_locked().
+ *
+ * The session mutex must be held from prepare through the publish, reject
+ * or discard that ends it.  runner->runtime is only set at publish, so this
+ * is what keeps a second ATTACH of the same runner from pinning another
+ * page meanwhile, and so bounds a session's pages by its runner limit.
+ * The mutex is therefore taken before mmap_lock here and before page locks
+ * when the page is later unpinned.  None of this runs under an attachment
+ * state_lock.
+ */
+int pvsched_runner_prepare_attach_locked(struct pvsched_vcpu_runner *runner,
+					 struct task_struct *task,
+					 const struct pvsched_attach_params *params,
+					 struct pvsched_runner_runtime **prepared,
+					 enum pvsched_status *status)
+{
+	struct pvsched_negotiation_request request;
+	struct pvsched_default_guest_area guest;
+	struct pvsched_runner_runtime *runtime;
+	struct pvsched_shm *shm;
+	int ret;
+
+	lockdep_assert_held(&runner->session->lock);
+	if (runner->runtime)
+		return -EEXIST;
+	runtime = kzalloc(sizeof(*runtime), GFP_KERNEL_ACCOUNT);
+	if (!runtime)
+		return -ENOMEM;
+	ret = pvsched_runner_runtime_prepare(runtime, task,
+					     params->config, params->cs_budget_ns,
+					     params->generic_budget_ns,
+					     &runner->ticket_owner,
+					     params->deboost_notify);
+	if (ret) {
+		/* A failed prepare has already undone itself. */
+		kfree(runtime);
+		return ret;
+	}
+	runtime->idle_hold_ns = params->idle_hold_ns;
+	/* A reattach must restore the original baseline, not adopt a new one. */
+	if (runner->baseline_valid &&
+	    !pvsched_baseline_equal(&runner->baseline, &runtime->baseline)) {
+		ret = -EBUSY;
+		goto err_discard;
+	}
+	/*
+	 * The page is guest memory in the VMM, which is the vCPU thread's own
+	 * address space; pin and charge there, whoever issued the ATTACH.
+	 */
+	shm = &runtime->attachment.shm;
+	ret = pvsched_shm_prepare(shm, runtime->attachment.owner_mm,
+				  params->user_addr, params->cap_ipc_lock,
+				  params->memlock_limit_pages);
+	if (ret)
+		goto err_discard;
+	pvsched_shm_bridge_read_negotiation(shm, &request, &guest);
+	runtime->negotiation = pvsched_negotiate_default(&request, &guest);
+	*status = runtime->negotiation;
+	*prepared = runtime;
+	return 0;
+
+err_discard:
+	/* The page is not pinned yet, or its failed prepare released it. */
+	pvsched_runner_discard_prepared_locked(runtime);
+	return ret;
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_prepare_attach_locked);
+
+/* publish() commit callback: the response and ENABLED become visible last. */
+static void pvsched_runner_commit_enabled(struct pvsched_attachment *attachment,
+					  void *data)
+{
+	pvsched_shm_bridge_publish_response(&attachment->shm,
+					    PVSCHED_STATUS_ENABLED);
+}
+
+/* Publish a prepared runtime; only an ENABLED negotiation may serve. */
+int pvsched_runner_publish_prepared_locked(struct pvsched_vcpu_runner *runner,
+					   struct pvsched_runner_runtime *runtime)
+{
+	if (WARN_ON_ONCE(runtime->negotiation != PVSCHED_STATUS_ENABLED))
+		return -EINVAL;
+	return pvsched_runner_publish_runtime_locked(runner, runtime,
+						     pvsched_runner_commit_enabled,
+						     NULL);
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_publish_prepared_locked);
+
+/* Undo a prepared, never-published runtime. */
+void pvsched_runner_discard_prepared_locked(struct pvsched_runner_runtime *runtime)
+{
+	pvsched_shm_release(&runtime->attachment.shm);
+	pvsched_runner_runtime_release(runtime);
+	kfree(runtime);
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_discard_prepared_locked);
+
+/* Publish the completed rejection on the page, then undo the preparation. */
+void pvsched_runner_reject_prepared_locked(struct pvsched_runner_runtime *runtime)
+{
+	if (!WARN_ON_ONCE(runtime->negotiation == PVSCHED_STATUS_ENABLED))
+		pvsched_shm_bridge_publish_response(&runtime->attachment.shm,
+						    runtime->negotiation);
+	pvsched_runner_discard_prepared_locked(runtime);
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_reject_prepared_locked);
