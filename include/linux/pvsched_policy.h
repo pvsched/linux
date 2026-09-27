@@ -41,6 +41,15 @@ enum pvsched_reconcile_event {
 	PVSCHED_RECONCILE_INJECT,
 };
 
+/* Guest request fields of the negotiation header, as one private snapshot. */
+struct pvsched_negotiation_request {
+	u32 abi_version;
+	u32 policy_version;
+	char policy_name[PVSCHED_NAME_MAX];
+	u32 protocol_id;
+	u32 requested_mode;
+};
+
 /*
  * What an applied value is for, which selects the budgets it drains.  A
  * class says what the elevation is for, not how strong it is; each policy
