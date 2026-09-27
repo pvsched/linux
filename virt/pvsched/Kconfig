@@ -18,3 +18,13 @@ config PVSCHED_SHM_KUNIT_TEST
 	  partial-failure unwind: which mappings are admitted, the global
 	  page limit and memlock charge, refusing one physical page for
 	  two attachments, and releasing every step exactly once.
+
+config PVSCHED_SHM_BRIDGE_KUNIT_TEST
+	tristate "KUnit tests for pvsched shared-memory bridge" if !KUNIT_ALL_TESTS
+	depends on KUNIT && PVSCHED
+	default KUNIT_ALL_TESTS
+	help
+	  Test the bridge that alone reads and writes a shared page: the
+	  guest snapshot and its acknowledgment ordering, VMENTRY feedback,
+	  the negotiation snapshot, and a response whose status is stored
+	  last with release ordering.

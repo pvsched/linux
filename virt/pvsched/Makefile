@@ -25,3 +25,6 @@ pvsched-lifecycle-test-y := lifecycle_test.o
 
 obj-$(CONFIG_PVSCHED_SHM_KUNIT_TEST) += pvsched-shm-test.o
 pvsched-shm-test-y := shm_test.o
+
+obj-$(CONFIG_PVSCHED_SHM_BRIDGE_KUNIT_TEST) += pvsched-shm-bridge-test.o
+pvsched-shm-bridge-test-y := shm_bridge_test.o
