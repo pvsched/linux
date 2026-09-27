@@ -60,6 +60,8 @@ struct pvsched_runner_runtime {
 	struct pvsched_default_guest_area last_guest_area;
 	/* Persistent owner state that prevents ticket reuse across attachments. */
 	struct pvsched_ticket_owner *ticket_owner;
+	/* Negotiation decided when ATTACH prepared this runtime. */
+	enum pvsched_status negotiation;
 	/* Pinned hard cap timer; its callback only forces a nonfast exit. */
 	struct hrtimer cutoff_timer;
 	/* Source-guest-mode injection is applied after guest state is unloaded. */

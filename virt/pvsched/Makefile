@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 obj-$(CONFIG_PVSCHED) += pvsched.o
-pvsched-y := core.o shm.o shm_bridge.o attachment.o lifecycle.o accounting.o runtime_accounting.o \
+pvsched-y := core.o shm.o shm_bridge.o negotiation.o attachment.o lifecycle.o accounting.o runtime_accounting.o \
 	    policy.o default_policy.o runner_runtime.o event_service.o
 
 obj-$(CONFIG_PVSCHED_ACCOUNTING_KUNIT_TEST) += pvsched-accounting-test.o

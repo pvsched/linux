@@ -2,6 +2,11 @@
 #ifndef _VIRT_PVSCHED_LIFECYCLE_H
 #define _VIRT_PVSCHED_LIFECYCLE_H
 
+#include <linux/types.h>
+#include <uapi/linux/pvsched.h>
+
+struct mm_struct;
+struct task_struct;
 struct pvsched_attachment;
 struct pvsched_policy_entry;
 struct pvsched_session;
@@ -31,5 +36,28 @@ void pvsched_session_release_runtimes(struct pvsched_session *session);
 void pvsched_runner_query_locked(struct pvsched_vcpu_runner *runner,
 				 u32 *state, u32 *flags, int *last_fault);
 void pvsched_runner_detach_runtime_locked(struct pvsched_vcpu_runner *runner);
+
+/* Fixed inputs of one ATTACH, already validated by the ioctl layer. */
+struct pvsched_attach_params {
+	unsigned long user_addr;
+	/* The policy the attachment binds. */
+	struct pvsched_policy_entry *entry;
+	u64 cs_budget_ns;
+	u64 generic_budget_ns;
+	bool deboost_notify;
+	u64 idle_hold_ns;
+	bool cap_ipc_lock;
+	unsigned long memlock_limit_pages;
+};
+
+int pvsched_runner_prepare_attach_locked(struct pvsched_vcpu_runner *runner,
+					 struct task_struct *task,
+					 const struct pvsched_attach_params *params,
+					 struct pvsched_runner_runtime **prepared,
+					 enum pvsched_status *status);
+int pvsched_runner_publish_prepared_locked(struct pvsched_vcpu_runner *runner,
+					   struct pvsched_runner_runtime *runtime);
+void pvsched_runner_reject_prepared_locked(struct pvsched_runner_runtime *runtime);
+void pvsched_runner_discard_prepared_locked(struct pvsched_runner_runtime *runtime);
 
 #endif /* _VIRT_PVSCHED_LIFECYCLE_H */
