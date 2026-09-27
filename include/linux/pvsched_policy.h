@@ -8,7 +8,8 @@
  * lifetime, the KVM hooks, the budgets and the host reasons.  A policy maps
  * that input to parameters of its own, opaque to pvsched, and applies them
  * with its own setter.  The built-in "default" policy is registered first,
- * and a module can register more.
+ * and a module can register more.  A VMM selects one per session, and a
+ * guest can only negotiate for that one.
  */
 #ifndef _LINUX_PVSCHED_POLICY_H
 #define _LINUX_PVSCHED_POLICY_H
@@ -110,14 +111,17 @@ struct pvsched_map_input {
  * @params_size: size of the parameters, 1..PVSCHED_POLICY_PARAMS_MAX
  * @priv_size: size of the per-vCPU private state, 0..PVSCHED_POLICY_PRIV_MAX
  * @owner: set by pvsched_register_policy()
+ * @negotiate: optional extra check of a guest's request at attach
  * @capture_baseline: record the task's current state as the restore target
  * @map: turn the input into parameters and their class
  * @apply: apply parameters to ctx->task
  * @owned: optional; whether ctx->task still has the value applied last
  *
- * @capture_baseline runs in process context under the session mutex and may
- * sleep.  pvsched zeroes the baseline buffer before it; a nonzero return
- * refuses the attach.
+ * @negotiate and @capture_baseline run in process context under the session
+ * mutex and may sleep.  @negotiate runs after pvsched's own checks of the
+ * request; a nonzero result refuses the attach with PVSCHED_STATUS_DISABLED.
+ * pvsched zeroes the baseline buffer before @capture_baseline; a nonzero
+ * return refuses the attach.
  *
  * @map, @apply and @owned run with the attachment's raw state lock held and
  * IRQs off, at run entry, the IRQ-on VM exit, a cancelled entry, halt, an
@@ -145,6 +149,7 @@ struct pvsched_policy_ops {
 	u32 priv_size;
 	struct module *owner;
 
+	int (*negotiate)(const struct pvsched_negotiation_request *request);
 	int (*capture_baseline)(struct pvsched_policy_ctx *ctx, void *baseline);
 
 	int (*map)(struct pvsched_policy_ctx *ctx,
