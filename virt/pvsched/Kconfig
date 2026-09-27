@@ -41,6 +41,17 @@ config PVSCHED_SHM_BRIDGE_KUNIT_TEST
 	  the negotiation snapshot, and a response whose status is stored
 	  last with release ordering.
 
+config PVSCHED_NEGOTIATION_KUNIT_TEST
+	tristate "KUnit tests for pvsched shared-page negotiation" if !KUNIT_ALL_TESTS
+	depends on KUNIT && PVSCHED
+	default KUNIT_ALL_TESTS
+	help
+	  Test the negotiation decision against the session's policy: the
+	  fixed rejection order (ABI, name encoding, policy, version,
+	  protocol, mode, guest fields, then the policy's own check),
+	  policy-name encoding rules and the guest fields that must be zero
+	  on a fresh attach.
+
 config PVSCHED_POLICY_KUNIT_TEST
 	tristate "KUnit tests for the pvsched host policy registry" if !KUNIT_ALL_TESTS
 	depends on KUNIT && PVSCHED
