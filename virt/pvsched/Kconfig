@@ -66,3 +66,16 @@ config PVSCHED_POLICY_KUNIT_TEST
 	  incomplete or duplicate policy, lookup by name and version, the
 	  built-in default policy listed first, and an unregistered policy
 	  that is no longer found while a reference keeps its entry alive.
+
+config PVSCHED_CONTROL_KUNIT_TEST
+	tristate "KUnit tests for pvsched shared-page control ioctls" if !KUNIT_ALL_TESTS
+	depends on KUNIT && PVSCHED && KVM && X86_64 && MMU
+	default KUNIT_ALL_TESTS
+	help
+	  Drive ATTACH_SHM and DETACH_SHM through the control device's ioctl
+	  entry with a real anonymous guest page: enabled attach, rejection,
+	  input errors, idempotent detach and final close.  The KUnit thread
+	  is registered as the runner and given its own address space.  Also
+	  test QUERY_POLICY and SET_POLICY: listing, the input checks,
+	  selection exactly once and before any runner, the pin a session
+	  holds until close, and a policy unregistered while in use.

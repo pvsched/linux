@@ -37,3 +37,6 @@ pvsched-negotiation-test-y := negotiation_test.o
 
 obj-$(CONFIG_PVSCHED_POLICY_KUNIT_TEST) += pvsched-policy-test.o
 pvsched-policy-test-y := policy_test.o
+
+obj-$(CONFIG_PVSCHED_CONTROL_KUNIT_TEST) += pvsched-control-test.o
+pvsched-control-test-y := core_test.o
