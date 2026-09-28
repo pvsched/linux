@@ -551,6 +551,73 @@ static void pvsched_runner_slice_and_slack_restore_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, state.timer_slack_ns, slack_ns);
 }
 
+/* A guest IDLE excursion keeps the latent nice and is not an external owner. */
+static void pvsched_runner_latent_nice_through_idle_test(struct kunit *test)
+{
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_runner_test_ctx *ctx;
+	struct sched_task_state state;
+
+	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
+	if (!ctx)
+		return;
+	/* A guest nice other than the baseline's must survive the excursion. */
+	guest.task_intent.current_task.nice = 2;
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+			 PVSCHED_RECONCILE_RUN_ENTER, &guest), 0);
+	pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, 2, 0);
+
+	guest.task_intent.current_task.sched_policy = SCHED_IDLE;
+	guest.task_intent.current_task.nice = 0;
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+			 PVSCHED_RECONCILE_CANCEL, &guest), 0);
+	sched_get_task_state(ctx->task, &state);
+	KUNIT_EXPECT_EQ(test, state.policy, SCHED_IDLE);
+
+	/* Back to NORMAL at the same nice: it is applied, not the baseline. */
+	guest.task_intent.current_task.sched_policy = SCHED_NORMAL;
+	guest.task_intent.current_task.nice = 2;
+	KUNIT_EXPECT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+			PVSCHED_RECONCILE_CANCEL, &guest), 0);
+	pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, 2, 0);
+	KUNIT_EXPECT_TRUE(test, ctx->runtime.attachment.active);
+	KUNIT_EXPECT_EQ(test, ctx->runtime.last_fault, 0);
+}
+
+/* IDLE is not RT: the custom slice and timer slack stay untouched. */
+static void pvsched_runner_slice_and_slack_through_idle_test(struct kunit *test)
+{
+	const u64 slice_ns = 2 * NSEC_PER_MSEC;
+	const u64 slack_ns = 1234567;
+	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
+	struct pvsched_runner_test_ctx *ctx;
+	struct sched_task_state state;
+
+	ctx = pvsched_runner_test_setup(test, 5, slice_ns, slack_ns);
+	if (!ctx)
+		return;
+	guest.task_intent.current_task.nice = 5;
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+			 PVSCHED_RECONCILE_RUN_ENTER, &guest), 0);
+	guest.task_intent.current_task.sched_policy = SCHED_IDLE;
+	guest.task_intent.current_task.nice = 0;
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+			 PVSCHED_RECONCILE_CANCEL, &guest), 0);
+	sched_get_task_state(ctx->task, &state);
+	KUNIT_EXPECT_EQ(test, state.policy, SCHED_IDLE);
+	KUNIT_EXPECT_EQ(test, state.timer_slack_ns, slack_ns);
+
+	guest.task_intent.current_task.sched_policy = SCHED_NORMAL;
+	guest.task_intent.current_task.nice = 5;
+	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
+			 PVSCHED_RECONCILE_CANCEL, &guest), 0);
+	sched_get_task_state(ctx->task, &state);
+	KUNIT_EXPECT_EQ(test, state.policy, SCHED_NORMAL);
+	KUNIT_EXPECT_TRUE(test, state.custom_slice);
+	KUNIT_EXPECT_EQ(test, state.slice_ns, slice_ns);
+	KUNIT_EXPECT_EQ(test, state.timer_slack_ns, slack_ns);
+}
+
 static void pvsched_runner_same_tuple_skips_setter_test(struct kunit *test)
 {
 	struct pvsched_runner_test_ctx *ctx;
@@ -2858,6 +2925,8 @@ static struct kunit_case pvsched_runner_runtime_test_cases[] = {
 	KUNIT_CASE(pvsched_runner_latent_nice_restore_test),
 	KUNIT_CASE(pvsched_runner_normal_to_fifo_latent_nice_test),
 	KUNIT_CASE(pvsched_runner_slice_and_slack_restore_test),
+	KUNIT_CASE(pvsched_runner_latent_nice_through_idle_test),
+	KUNIT_CASE(pvsched_runner_slice_and_slack_through_idle_test),
 	KUNIT_CASE(pvsched_runner_same_tuple_skips_setter_test),
 	KUNIT_CASE(pvsched_runner_run_leave_restores_and_cancels_test),
 	KUNIT_CASE(pvsched_runner_run_leave_closes_guest_test),
