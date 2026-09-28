@@ -65,3 +65,17 @@ config PVSCHED_CONTROL_KUNIT_TEST
 	  entry with a real anonymous guest page: enabled attach, rejection,
 	  input errors, idempotent detach and final close.  The KUnit thread
 	  is registered as the runner and given its own address space.
+
+config PARAVIRT_SCHED_GUEST
+	bool "Paravirtualized scheduling guest support"
+	depends on X86_64 && PARAVIRT && TRACEPOINTS && !PREEMPT_RT
+	help
+	  Publish this guest's scheduling intent to a pvsched host: the
+	  current and most urgent woken task, interrupt and softirq state,
+	  and acknowledgments of the host's interrupt handoffs.  A transport
+	  driver, such as the pvsched PCI driver, hands the pages to the VMM.
+	  Nothing is published unless the host enables a vCPU.  The pages are
+	  addressed by x86 APIC id and the interrupt hooks sit in the x86
+	  entry code, so this is x86-64 only.
+
+	  If unsure, say N.
