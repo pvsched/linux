@@ -2,6 +2,8 @@
 
 obj-$(CONFIG_PVSCHED) += pvsched.o
 obj-$(CONFIG_PARAVIRT_SCHED_GUEST) += guest.o
+obj-$(CONFIG_PVSCHED_GUEST_PCI) += pvsched_guest_pci.o
+pvsched_guest_pci-y := guest_pci.o
 pvsched-y := core.o shm.o shm_bridge.o negotiation.o attachment.o lifecycle.o accounting.o runtime_accounting.o \
 	    default_policy.o runner_runtime.o event_service.o
 
