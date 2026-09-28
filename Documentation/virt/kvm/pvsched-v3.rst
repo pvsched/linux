@@ -552,6 +552,43 @@ opaque policy storage; the custom guest area, custom host-feedback bytes,
 and extension storage are the policy-defined regions.  No vCPU-placement ABI
 is reserved speculatively.
 
+Guest core and PCI transport
+============================
+
+``CONFIG_PARAVIRT_SCHED_GUEST`` builds the guest core into an x86-64 guest.
+It owns one page per present CPU and publishes into it only after the host
+has enabled that vCPU:
+
+* ``task_intent``: ``sched_switch`` publishes the incoming task and clears the
+  pending hint.  ``sched_wakeup``, under the woken task's runqueue lock,
+  publishes a pending hint when the woken task is more urgent than both the
+  current task and any earlier hint.
+* ``cs_state``: recomputed from the preempt count right after every hardirq
+  and softirq count change, in the hardirq entry and exit paths (including the
+  reschedule IPI's entry) and around softirq processing.
+* ``interrupt_ack``: whenever ``cs_state`` shows a hardirq, the core then
+  echoes an outstanding host ticket with a release store.
+
+When the host sets ``PVSCHED_HINT_KICK_DEBOOST``, the guest forces an exit
+after a switch that lowers its most urgent published intent, and when its last
+CS level ends while the host still applies a CS boost that no published RT or
+deadline task needs.
+It never kicks on the way to idle, because the halt that follows is itself a
+host checkpoint.  NMI entry, preemption-disabled sections, a priority change of
+the running task without a switch, and stale pending hints are not yet
+published.  ``pvsched_guest.allow=`` lists the host policies the guest accepts
+(``*`` by default).
+
+``CONFIG_PVSCHED_GUEST_PCI`` carries the pages to the VMM through the pvsched
+PCI device (``include/uapi/linux/pvsched_pci.h``).  The driver writes one
+``{apic_id, gpa}`` entry per vCPU into the BAR1 table and rings the BAR0
+doorbell.  The VMM attaches every listed page before the doorbell write
+retires, so each page's status is final when the write returns.  The RESULT
+register reports failures a page status cannot show: a table the VMM
+rejected, or a page it could not attach.  A doorbell of zero entries detaches
+everything, which the driver does on unbind and shutdown.  The KICK register's
+exit is itself the event.
+
 Runtime scope
 =============
 
