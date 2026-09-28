@@ -93,3 +93,15 @@ config PARAVIRT_SCHED_GUEST
 	  entry code, so this is x86-64 only.
 
 	  If unsure, say N.
+
+config PVSCHED_GUEST_PCI
+	tristate "pvsched guest PCI transport"
+	depends on PARAVIRT_SCHED_GUEST && PCI
+	help
+	  Carry the pvsched guest pages to the VMM through the pvsched PCI
+	  device: publish one {APIC id, page address} entry per vCPU and
+	  ring the doorbell, report failures the device returns, and let
+	  the guest core force a prompt host deboost through the kick
+	  register.
+
+	  If unsure, say N.
