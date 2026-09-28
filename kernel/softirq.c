@@ -26,6 +26,7 @@
 #include <linux/smpboot.h>
 #include <linux/tick.h>
 #include <linux/irq.h>
+#include <linux/pvsched_guest.h>
 #include <linux/wait_bit.h>
 #include <linux/workqueue.h>
 
@@ -596,6 +597,7 @@ static void handle_softirqs(bool ksirqd)
 	pending = local_softirq_pending();
 
 	softirq_handle_begin();
+	pvsched_guest_cs_update();
 	in_hardirq = lockdep_softirq_start();
 	account_softirq_enter(current);
 
@@ -648,6 +650,7 @@ restart:
 	account_softirq_exit(current);
 	lockdep_softirq_end(in_hardirq);
 	softirq_handle_end();
+	pvsched_guest_cs_update();
 	current_restore_flags(old_flags, PF_MEMALLOC);
 }
 
@@ -668,6 +671,8 @@ void irq_enter_rcu(void)
 		tick_irq_enter();
 
 	account_hardirq_enter(current);
+	/* Publish the hardirq to a pvsched host before any handler runs. */
+	pvsched_guest_cs_update();
 }
 
 /**
@@ -719,6 +724,7 @@ static inline void __irq_exit_rcu(void)
 #endif
 	account_hardirq_exit(current);
 	preempt_count_sub(HARDIRQ_OFFSET);
+	pvsched_guest_cs_update();
 	if (!in_interrupt() && local_softirq_pending())
 		invoke_softirq();
 

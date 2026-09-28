@@ -10,6 +10,7 @@
 #ifndef __ASSEMBLER__
 #include <linux/entry-common.h>
 #include <linux/hardirq.h>
+#include <linux/pvsched_guest.h>
 
 #include <asm/irq_stack.h>
 
@@ -288,8 +289,10 @@ static __always_inline void __##func(struct pt_regs *regs);		\
 static __always_inline void instr_##func(struct pt_regs *regs)		\
 {									\
 	__irq_enter_raw();						\
+	pvsched_guest_cs_update();					\
 	__##func (regs);						\
 	__irq_exit_raw();						\
+	pvsched_guest_cs_update();					\
 }									\
 									\
 __visible noinstr void func(struct pt_regs *regs)			\
