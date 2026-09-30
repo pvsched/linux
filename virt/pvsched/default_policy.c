@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <linux/errno.h>
+#include <linux/export.h>
 #include <linux/sched.h>
 #include <linux/sched/prio.h>
+#include <kunit/visibility.h>
 #include <asm/byteorder.h>
 
 #include "default_policy.h"
@@ -161,3 +163,11 @@ out:
 	*result = selected;
 	return 0;
 }
+
+struct pvsched_policy_ops pvsched_default_policy_ops = {
+	.name = PVSCHED_DEFAULT_POLICY_NAME,
+	.version = PVSCHED_DEFAULT_POLICY_VERSION,
+	.protocol = PVSCHED_PROTOCOL_DEFAULT,
+	.params_size = sizeof(struct pvsched_default_params),
+};
+EXPORT_SYMBOL_IF_KUNIT(pvsched_default_policy_ops);

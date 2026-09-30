@@ -2,6 +2,8 @@
 #ifndef _VIRT_PVSCHED_DEFAULT_POLICY_H
 #define _VIRT_PVSCHED_DEFAULT_POLICY_H
 
+#include <linux/build_bug.h>
+#include <linux/pvsched_policy.h>
 #include <linux/types.h>
 #include <uapi/linux/pvsched.h>
 
@@ -24,11 +26,28 @@ struct pvsched_default_policy_result {
 	enum pvsched_default_policy_source source;
 };
 
+/*
+ * Parameters of the default policy.  Every value carries the baseline's
+ * slice and timer slack, so two values differ only in their tuple; the
+ * explicit reserved bytes leave no padding for byte comparisons.
+ */
+struct pvsched_default_params {
+	struct pvsched_prio_desc prio;
+	u8 custom_slice;
+	u8 reserved[4];
+	u64 slice_ns;
+	u64 timer_slack_ns;
+};
+static_assert(sizeof(struct pvsched_default_params) == 24);
+
+extern struct pvsched_policy_ops pvsched_default_policy_ops;
+
 /**
  * pvsched_default_policy_select() - select the built-in scheduling request
  * @config: host policy configuration
  * @baseline_nice: per-vCPU SCHED_NORMAL nice (-20..19) captured at registration
- * @guest: private guest-area snapshot the caller validated, not shared memory
+ * @guest: private guest-area snapshot that pvsched_default_guest_valid()
+ *	   accepted, not shared memory
  * @cs_throttled: whether the critical-section budget is throttled
  * @generic_throttled: whether the generic budget is throttled
  * @result: selected request, not applied scheduling state
