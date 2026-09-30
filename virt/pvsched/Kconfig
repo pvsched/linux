@@ -7,3 +7,13 @@ config PVSCHED
 	  creates device-owned sessions and records inactive vCPU runner
 	  identities.  It does not attach shared pages, integrate with KVM, or
 	  change task scheduling.
+
+config PVSCHED_POLICY_KUNIT_TEST
+	tristate "KUnit tests for the pvsched host policy registry" if !KUNIT_ALL_TESTS
+	depends on KUNIT && PVSCHED
+	default KUNIT_ALL_TESTS
+	help
+	  Test host policy registration: the checks that refuse an invalid or
+	  duplicate policy, lookup by name and version, the built-in default
+	  policy listed first, and an unregistered policy that is no longer
+	  found while a reference keeps its entry alive.
