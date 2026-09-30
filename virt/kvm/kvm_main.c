@@ -3636,6 +3636,19 @@ out:
 }
 
 /*
+ * Called around each sleep in kvm_vcpu_block().  kvm_arch_vcpu_block_wake()
+ * is called after the sleep only if kvm_arch_vcpu_block_sleep() returned true.
+ */
+bool __weak kvm_arch_vcpu_block_sleep(struct kvm_vcpu *vcpu)
+{
+	return false;
+}
+
+void __weak kvm_arch_vcpu_block_wake(struct kvm_vcpu *vcpu)
+{
+}
+
+/*
  * Block the vCPU until the vCPU is runnable, an event arrives, or a signal is
  * pending.  This is mostly used when halting a vCPU, but may also be used
  * directly for other vCPU non-runnable states, e.g. x86's Wait-For-SIPI.
@@ -3653,13 +3666,18 @@ bool kvm_vcpu_block(struct kvm_vcpu *vcpu)
 	preempt_enable();
 
 	for (;;) {
+		bool arch_wake;
+
 		set_current_state(TASK_INTERRUPTIBLE);
 
 		if (kvm_vcpu_check_block(vcpu) < 0)
 			break;
 
 		waited = true;
+		arch_wake = kvm_arch_vcpu_block_sleep(vcpu);
 		schedule();
+		if (arch_wake)
+			kvm_arch_vcpu_block_wake(vcpu);
 	}
 
 	preempt_disable();
