@@ -338,9 +338,10 @@ The inner hooks report these additional facts:
 * ``kvm_pvsched_vmexit`` reports the slow reconciliation checkpoint after
   host interrupts are enabled and before preemption is enabled.  pvsched
   closes or settles its guest accounting window at this IRQ-on fact.  The
-  fact also reports whether the exit is a non-nested ``HLT`` exit, whether
-  or not KVM has handled it yet, so a consumer can keep a halting vCPU
-  boosted until it blocks.
+  fact also reports whether the exit is a non-nested ``HLT`` exit (on SVM
+  with the Idle HLT intercept, an ``IDLE_HLT`` exit), whether or not KVM has
+  handled it yet, so a consumer can keep a halting vCPU boosted until it
+  blocks.
   ``kvm_pvsched_vmentry_cancel`` reports the equivalent checkpoint for a
   common request cancellation before KVM calls the vendor.  Such a
   cancellation has no matching IRQ-off event because there was no vendor

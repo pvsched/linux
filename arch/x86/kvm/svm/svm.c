@@ -4258,10 +4258,14 @@ static u32 svm_pvsched_get_mode_flags(struct kvm_vcpu *vcpu)
 
 static bool svm_pvsched_is_hlt_exit(struct kvm_vcpu *vcpu)
 {
+	u64 exit_code;
+
 	if (is_guest_mode(vcpu))
 		return false;
 
-	return to_svm(vcpu)->vmcb->control.exit_code == SVM_EXIT_HLT;
+	/* With the Idle HLT intercept, a halting HLT exits as IDLE_HLT. */
+	exit_code = to_svm(vcpu)->vmcb->control.exit_code;
+	return exit_code == SVM_EXIT_HLT || exit_code == SVM_EXIT_IDLE_HLT;
 }
 
 static bool svm_pvsched_interrupt_ready(struct kvm_vcpu *vcpu, u32 mode_flags)
