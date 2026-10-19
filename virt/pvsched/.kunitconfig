@@ -18,3 +18,12 @@ CONFIG_PVSCHED_SHM_BRIDGE_KUNIT_TEST=y
 CONFIG_PVSCHED_NEGOTIATION_KUNIT_TEST=y
 CONFIG_PVSCHED_POLICY_KUNIT_TEST=y
 CONFIG_PVSCHED_CONTROL_KUNIT_TEST=y
+# Production timer behaviour.  KUnit runs right after boot, before the
+# clocksource watchdog verifies the TSC, so the kernel stays tick based
+# unless it is told the TSC is reliable: pass --kernel_args=tsc=reliable.
+CONFIG_HIGH_RES_TIMERS=y
+CONFIG_NO_HZ_IDLE=y
+# kunit.py's olddefconfig leaves SMP off.  The runner tests need a second
+# CPU: on a uniprocessor PREEMPT_NONE kernel their spinning vCPU thread
+# starves the RCU grace-period kthread and the suite hangs.
+CONFIG_SMP=y

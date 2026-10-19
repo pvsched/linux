@@ -482,6 +482,39 @@ static void pvsched_runner_expect_state(struct kunit *test,
 	KUNIT_EXPECT_EQ(test, state.rt_priority, rt_prio);
 }
 
+/*
+ * An immediate cutoff is a 0 ns pinned hard timer.  With high-resolution
+ * timers it expires as soon as the arming CPU enables interrupts again,
+ * often before the test looks, so hrtimer_active() cannot observe it.
+ * Its expiry time survives the expiry: check that it was armed to expire
+ * within the call that armed it.  A timer not armed in that call has an
+ * expiry outside that window and fails.
+ */
+static void
+pvsched_runner_expect_immediate_cutoff(struct kunit *test,
+				       struct pvsched_runner_runtime *runtime,
+				       ktime_t before)
+{
+	ktime_t expires = hrtimer_get_expires(&runtime->cutoff_timer);
+
+	KUNIT_EXPECT_GE(test, ktime_compare(expires, before), 0);
+	KUNIT_EXPECT_LE(test, ktime_compare(expires, ktime_get()), 0);
+}
+
+/*
+ * Nothing armed the cutoff since @before.  hrtimer_active() cannot show
+ * that either: a wrongly armed 0 ns cutoff may already have fired.
+ */
+static void
+pvsched_runner_expect_no_cutoff_since(struct kunit *test,
+				      struct pvsched_runner_runtime *runtime,
+				      ktime_t before)
+{
+	ktime_t expires = hrtimer_get_expires(&runtime->cutoff_timer);
+
+	KUNIT_EXPECT_LT(test, ktime_compare(expires, before), 0);
+}
+
 static void pvsched_runner_latent_nice_restore_test(struct kunit *test)
 {
 	struct pvsched_runner_test_ctx *ctx;
@@ -687,6 +720,7 @@ static void pvsched_runner_run_leave_closes_guest_test(struct kunit *test)
 static void pvsched_runner_deferred_guest_start_has_no_late_setter_test(struct kunit *test)
 {
 	struct pvsched_runner_test_ctx *ctx;
+	ktime_t before;
 	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
 	u32 setter_calls;
 
@@ -701,10 +735,11 @@ static void pvsched_runner_deferred_guest_start_has_no_late_setter_test(struct k
 
 	/* Inject an impossible accounting phase to fail while VMENTRY is unsafe. */
 	ctx->runtime.accounting.phase = PVSCHED_RUNTIME_GUEST + 1;
+	before = ktime_get();
 	KUNIT_EXPECT_EQ(test, pvsched_runner_test_guest_start(&ctx->runtime), -EINVAL);
 	KUNIT_EXPECT_EQ(test, ctx->runtime.restore_owed_error, -EINVAL);
 	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setter_calls);
-	KUNIT_EXPECT_TRUE(test, hrtimer_active(&ctx->runtime.cutoff_timer));
+	pvsched_runner_expect_immediate_cutoff(test, &ctx->runtime, before);
 
 	KUNIT_EXPECT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
 			 PVSCHED_RECONCILE_VMEXIT, &guest), -EINVAL);
@@ -1021,7 +1056,7 @@ static void pvsched_runner_idle_hold_cutoff_test(struct kunit *test)
 	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
 	struct pvsched_host_area host = { };
 	struct pvsched_runner_test_ctx *ctx;
-	s64 remaining;
+	ktime_t before, expires;
 
 	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
 	if (!ctx)
@@ -1033,12 +1068,18 @@ static void pvsched_runner_idle_hold_cutoff_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, pvsched_runner_test_vmexit(ctx, &guest, true,
 							 false), 0);
 
-	/* A held boost is capped at its grace, well inside the CS budget. */
+	/*
+	 * A held boost is capped at its grace, well inside the CS budget.
+	 * Bound the expiry, not the time left, which a preempted test thread
+	 * could see run out.
+	 */
+	before = ktime_get();
 	KUNIT_ASSERT_EQ(test, pvsched_runner_test_vmentry(ctx, &guest, false, 0,
 							  &host), 0);
-	remaining = ktime_to_ns(hrtimer_get_remaining(&ctx->runtime.cutoff_timer));
-	KUNIT_EXPECT_GT(test, remaining, 0LL);
-	KUNIT_EXPECT_LE(test, remaining, 200LL * NSEC_PER_USEC);
+	expires = hrtimer_get_expires(&ctx->runtime.cutoff_timer);
+	KUNIT_EXPECT_GE(test, ktime_compare(expires, before), 0);
+	KUNIT_EXPECT_LE(test, ktime_compare(expires,
+					    ktime_add_us(ktime_get(), 200)), 0);
 
 	/* At the grace deadline the forced exit deboosts the idle guest. */
 	ctx->runtime.idle_hold_end_ns = 1;
@@ -1171,6 +1212,7 @@ static void pvsched_runner_assist_expiry_test(struct kunit *test)
 	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
 	struct pvsched_host_area host = { };
 	struct pvsched_runner_test_ctx *ctx;
+	ktime_t before;
 	u32 setters;
 
 	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
@@ -1182,11 +1224,12 @@ static void pvsched_runner_assist_expiry_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, pvsched_runner_test_event(ctx,
 		PVSCHED_RECONCILE_INJECT, NULL, PVSCHED_RUNNER_HOST, 0), 0);
 	setters = pvsched_runner_test_setter_calls(test);
+	before = ktime_get();
 	KUNIT_ASSERT_EQ(test, pvsched_runner_test_vmentry(ctx, &guest, false, 0,
 		&host), 0);
 	KUNIT_EXPECT_EQ(test, ctx->runtime.reasons, 0UL);
 	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters);
-	KUNIT_EXPECT_TRUE(test, hrtimer_active(&ctx->runtime.cutoff_timer));
+	pvsched_runner_expect_immediate_cutoff(test, &ctx->runtime, before);
 }
 
 static void pvsched_runner_no_ticket_retires_assists_test(struct kunit *test)
@@ -1194,6 +1237,7 @@ static void pvsched_runner_no_ticket_retires_assists_test(struct kunit *test)
 	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
 	struct pvsched_host_area host = { };
 	struct pvsched_runner_test_ctx *ctx;
+	ktime_t before;
 
 	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
 	if (!ctx)
@@ -1202,11 +1246,12 @@ static void pvsched_runner_no_ticket_retires_assists_test(struct kunit *test)
 		PVSCHED_RECONCILE_RUN_ENTER, &guest), 0);
 	KUNIT_ASSERT_EQ(test, pvsched_runner_test_event(ctx,
 		PVSCHED_RECONCILE_INJECT, NULL, PVSCHED_RUNNER_HOST, 0), 0);
+	before = ktime_get();
 	KUNIT_ASSERT_EQ(test, pvsched_runner_test_vmentry(ctx, &guest, true,
 		PVSCHED_RUNNER_MODE_NO_TICKET, &host), 0);
 	KUNIT_EXPECT_EQ(test, ctx->runtime.reasons, 0UL);
 	KUNIT_EXPECT_EQ(test, ctx->runtime.interrupt_ticket, 0ULL);
-	KUNIT_EXPECT_TRUE(test, hrtimer_active(&ctx->runtime.cutoff_timer));
+	pvsched_runner_expect_immediate_cutoff(test, &ctx->runtime, before);
 }
 
 /* Guest CS that still selects the CS FIFO needs no forced deboost exit. */
@@ -1944,6 +1989,7 @@ static void pvsched_runner_binding_mismatch_vmentry_defers_test(struct kunit *te
 {
 	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
 	struct pvsched_runner_test_ctx *ctx;
+	ktime_t before;
 	int first_key, replacement_key;
 	int ret;
 	u32 setters;
@@ -1957,11 +2003,12 @@ static void pvsched_runner_binding_mismatch_vmentry_defers_test(struct kunit *te
 					 PVSCHED_RECONCILE_RUN_ENTER, 0, false, false);
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	setters = pvsched_runner_test_setter_calls(test);
+	before = ktime_get();
 	ret = pvsched_runner_test_local_event(ctx, &replacement_key,
 					 PVSCHED_RECONCILE_CANCEL, 0, true, false);
 	KUNIT_EXPECT_EQ(test, ret, -ESTALE);
 	KUNIT_EXPECT_EQ(test, ctx->runtime.restore_owed_error, -ESTALE);
-	KUNIT_EXPECT_TRUE(test, hrtimer_active(&ctx->runtime.cutoff_timer));
+	pvsched_runner_expect_immediate_cutoff(test, &ctx->runtime, before);
 	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters);
 	ret = pvsched_runner_test_local_event(ctx, &first_key,
 					 PVSCHED_RECONCILE_VMEXIT, 0, false, false);
@@ -1975,6 +2022,7 @@ static void pvsched_runner_closed_vmentry_defers_restore_test(struct kunit *test
 {
 	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
 	struct pvsched_runner_test_ctx *ctx;
+	ktime_t before;
 	u32 setters;
 	int key;
 
@@ -1988,10 +2036,11 @@ static void pvsched_runner_closed_vmentry_defers_restore_test(struct kunit *test
 	pvsched_runner_runtime_disable(&ctx->runtime);
 	ctx->runtime.restore_owed_error = -EIO;
 	setters = pvsched_runner_test_setter_calls(test);
+	before = ktime_get();
 	KUNIT_EXPECT_EQ(test, pvsched_runner_test_local_event(ctx, &key,
 		PVSCHED_RECONCILE_CANCEL, 0, true, false), -ESHUTDOWN);
 	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters);
-	KUNIT_EXPECT_FALSE(test, hrtimer_active(&ctx->runtime.cutoff_timer));
+	pvsched_runner_expect_no_cutoff_since(test, &ctx->runtime, before);
 	pvsched_runner_runtime_drain_actions(&ctx->runtime);
 	KUNIT_EXPECT_EQ(test,
 		pvsched_runner_runtime_finish_close(&ctx->runtime, true), 0);
@@ -2007,6 +2056,7 @@ static void pvsched_runner_disabled_vmentry_defers_restore_test(struct kunit *te
 {
 	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
 	struct pvsched_runner_test_ctx *ctx;
+	ktime_t before;
 	u32 setters;
 	int key;
 
@@ -2020,10 +2070,11 @@ static void pvsched_runner_disabled_vmentry_defers_restore_test(struct kunit *te
 	pvsched_attachment_disable(&ctx->runtime.attachment);
 	ctx->runtime.restore_owed_error = -EIO;
 	setters = pvsched_runner_test_setter_calls(test);
+	before = ktime_get();
 	KUNIT_EXPECT_EQ(test, pvsched_runner_test_local_event(ctx, &key,
 		PVSCHED_RECONCILE_CANCEL, 0, true, false), -EIO);
 	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters);
-	KUNIT_EXPECT_TRUE(test, hrtimer_active(&ctx->runtime.cutoff_timer));
+	pvsched_runner_expect_immediate_cutoff(test, &ctx->runtime, before);
 	KUNIT_EXPECT_EQ(test, pvsched_runner_test_local_event(ctx, &key,
 		PVSCHED_RECONCILE_VMEXIT, 0, false, false), -EIO);
 	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters + 1);
@@ -2053,6 +2104,7 @@ static void pvsched_runner_halt_not_ready_test(struct kunit *test)
 	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
 	struct pvsched_host_area host = { };
 	struct pvsched_runner_test_ctx *ctx;
+	ktime_t before;
 	u32 setters;
 
 	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
@@ -2063,12 +2115,13 @@ static void pvsched_runner_halt_not_ready_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, pvsched_runner_test_event(ctx,
 		PVSCHED_RECONCILE_UNHALT, &guest, PVSCHED_RUNNER_HOST, 0), 0);
 	setters = pvsched_runner_test_setter_calls(test);
+	before = ktime_get();
 	KUNIT_ASSERT_EQ(test, pvsched_runner_test_vmentry(ctx, &guest, false, 0,
 		&host), 0);
 	KUNIT_EXPECT_EQ(test, ctx->runtime.reasons, 0UL);
 	KUNIT_EXPECT_EQ(test, ctx->runtime.interrupt_ticket, 0ULL);
 	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters);
-	KUNIT_EXPECT_TRUE(test, hrtimer_active(&ctx->runtime.cutoff_timer));
+	pvsched_runner_expect_immediate_cutoff(test, &ctx->runtime, before);
 }
 
 static void pvsched_runner_unhalt_does_not_freshly_boost_test(struct kunit *test)
@@ -2337,7 +2390,7 @@ static void pvsched_runner_expiry_forces_safe_downgrade_test(struct kunit *test)
 	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
 	struct pvsched_host_area host = { };
 	struct pvsched_runner_test_ctx *ctx;
-	ktime_t now;
+	ktime_t before;
 
 	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
 	if (!ctx)
@@ -2348,11 +2401,10 @@ static void pvsched_runner_expiry_forces_safe_downgrade_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, pvsched_runner_test_event(ctx,
 		PVSCHED_RECONCILE_INJECT, NULL, PVSCHED_RUNNER_HOST, 0), 0);
 	pvsched_runner_expect_state(test, ctx->task, SCHED_FIFO, 5, 60);
+	before = ktime_get();
 	KUNIT_ASSERT_EQ(test, pvsched_runner_test_vmentry(ctx, &guest, false, 0,
 		&host), 0);
-	now = ktime_get();
-	KUNIT_EXPECT_LE(test, ktime_compare(hrtimer_get_expires(
-		&ctx->runtime.cutoff_timer), now), 0);
+	pvsched_runner_expect_immediate_cutoff(test, &ctx->runtime, before);
 	KUNIT_EXPECT_EQ(test, ctx->runtime.reasons, 0UL);
 	KUNIT_EXPECT_EQ(test, ctx->runtime.interrupt_ticket, 0ULL);
 	pvsched_runner_guest_exit_irqoff(&ctx->runtime);
@@ -2368,8 +2420,8 @@ static void pvsched_runner_combined_reason_lifecycle_test(struct kunit *test)
 	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
 	struct pvsched_host_area host = { };
 	struct pvsched_runner_test_ctx *ctx;
+	ktime_t before;
 	u64 ticket;
-	ktime_t now;
 
 	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
 	if (!ctx)
@@ -2389,13 +2441,12 @@ static void pvsched_runner_combined_reason_lifecycle_test(struct kunit *test)
 			PVSCHED_RUNNER_REASON_HALT |
 			PVSCHED_RUNNER_REASON_INJECT);
 	KUNIT_EXPECT_EQ(test, ctx->runtime.interrupt_ticket, 0ULL);
+	before = ktime_get();
 	KUNIT_ASSERT_EQ(test, pvsched_runner_test_vmentry(ctx, &guest, false, 0,
 		&host), 0);
-	now = ktime_get();
 	KUNIT_EXPECT_EQ(test, ctx->runtime.reasons, 0UL);
 	pvsched_runner_expect_state(test, ctx->task, SCHED_FIFO, 5, 60);
-	KUNIT_EXPECT_LE(test, ktime_compare(hrtimer_get_expires(
-		&ctx->runtime.cutoff_timer), now), 0);
+	pvsched_runner_expect_immediate_cutoff(test, &ctx->runtime, before);
 	pvsched_runner_guest_exit_irqoff(&ctx->runtime);
 	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
 		PVSCHED_RECONCILE_VMEXIT, &guest), 0);
@@ -2556,6 +2607,7 @@ static void pvsched_runner_policy_kick_by_class_test(struct kunit *test)
 	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
 	struct pvsched_host_area host = { };
 	struct pvsched_runner_test_ctx *ctx;
+	ktime_t before;
 
 	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
 	if (!ctx)
@@ -2586,10 +2638,10 @@ static void pvsched_runner_policy_kick_by_class_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, pvsched_runner_test_event(ctx,
 		PVSCHED_RECONCILE_INJECT, NULL, PVSCHED_RUNNER_HOST, 0), 0);
 	KUNIT_EXPECT_EQ(test, ctx->runtime.applied_class, PVSCHED_CLASS_CS);
+	before = ktime_get();
 	KUNIT_ASSERT_EQ(test, pvsched_runner_test_vmentry(ctx, &guest, false, 0,
 		&host), 0);
-	KUNIT_EXPECT_LE(test, ktime_compare(hrtimer_get_expires(
-		&ctx->runtime.cutoff_timer), ktime_get()), 0);
+	pvsched_runner_expect_immediate_cutoff(test, &ctx->runtime, before);
 }
 
 /* Elevate to guest nice -5, so that a fault has something to restore. */
@@ -2832,6 +2884,7 @@ static void pvsched_runner_policy_declines_reasons_test(struct kunit *test)
 	struct pvsched_default_guest_area guest = pvsched_runner_test_guest();
 	struct pvsched_host_area host = { };
 	struct pvsched_runner_test_ctx *ctx;
+	ktime_t before;
 
 	ctx = pvsched_runner_test_setup(test, 5, 0, 0);
 	if (!ctx)
@@ -2855,11 +2908,12 @@ static void pvsched_runner_policy_declines_reasons_test(struct kunit *test)
 			  PVSCHED_RUNNER_REASON_HALT);
 	pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, 5, 0);
 	/* Nothing elevated, so the retired reasons force no exit. */
+	before = ktime_get();
 	KUNIT_ASSERT_EQ(test, pvsched_runner_test_event(ctx,
 		PVSCHED_RECONCILE_UNHALT, &guest, PVSCHED_RUNNER_HOST, 0), 0);
 	KUNIT_ASSERT_EQ(test, pvsched_runner_test_vmentry(ctx, &guest, false, 0,
 		&host), 0);
-	KUNIT_EXPECT_FALSE(test, hrtimer_active(&ctx->runtime.cutoff_timer));
+	pvsched_runner_expect_no_cutoff_since(test, &ctx->runtime, before);
 }
 
 /* Without an ownership check, pvsched cannot see an external owner. */
