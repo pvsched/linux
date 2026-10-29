@@ -316,6 +316,9 @@ int pvsched_runner_prepare_attach_locked(struct pvsched_vcpu_runner *runner,
 	lockdep_assert_held(&runner->session->lock);
 	if (runner->runtime)
 		return -EEXIST;
+	/* External policies cannot be attached yet. */
+	if (params->entry->kind != PVSCHED_POLICY_MANAGED)
+		return -EOPNOTSUPP;
 	runtime = kzalloc(sizeof(*runtime), GFP_KERNEL_ACCOUNT);
 	if (!runtime)
 		return -ENOMEM;

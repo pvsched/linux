@@ -141,6 +141,9 @@ struct pvsched_set_policy {
  * everything after the header, PVSCHED_OPAQUE_SIZE bytes at
  * PVSCHED_OPAQUE_OFFSET, to the policy and its guest side, which define
  * its layout, ownership and validation.
+ *
+ * An external policy is negotiated with the custom protocol and POLICY
+ * mode.  The host then writes only the header, and never clears the rest.
  */
 
 enum pvsched_status {

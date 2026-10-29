@@ -3,8 +3,16 @@
 #define _VIRT_PVSCHED_POLICY_H
 
 #include <linux/list.h>
+#include <linux/pvsched_external.h>
 #include <linux/pvsched_policy.h>
 #include <linux/refcount.h>
+
+enum pvsched_policy_kind {
+	/* pvsched runs its engine with the policy's map() and apply(). */
+	PVSCHED_POLICY_MANAGED,
+	/* pvsched only calls the policy's ops at each event. */
+	PVSCHED_POLICY_EXTERNAL,
+};
 
 /*
  * One registered policy.  The registry holds a reference while the entry is
@@ -14,7 +22,10 @@
 struct pvsched_policy_entry {
 	struct list_head node;
 	refcount_t ref;
+	enum pvsched_policy_kind kind;
+	/* The ops of its kind; the other pointer is NULL. */
 	struct pvsched_policy_ops *ops;
+	struct pvsched_external_ops *ext_ops;
 	struct module *owner;
 	/*
 	 * Unregistered: unlisted, so no longer found by name.  The registry
@@ -23,6 +34,26 @@ struct pvsched_policy_entry {
 	 */
 	bool dead;
 };
+
+/* What a guest negotiates for, and the registry looks up, for either kind. */
+static inline const char *
+pvsched_policy_name(const struct pvsched_policy_entry *entry)
+{
+	return entry->ops ? entry->ops->name : entry->ext_ops->name;
+}
+
+static inline u32
+pvsched_policy_version(const struct pvsched_policy_entry *entry)
+{
+	return entry->ops ? entry->ops->version : entry->ext_ops->version;
+}
+
+/* The runner baseline's size; an external policy keeps none. */
+static inline u32
+pvsched_policy_params_size(const struct pvsched_policy_entry *entry)
+{
+	return entry->ops ? entry->ops->params_size : 0;
+}
 
 /* Nonempty, NUL-terminated, and zero-padded after the terminator. */
 bool pvsched_policy_name_valid(const char *name);

@@ -218,7 +218,7 @@ static long pvsched_create_runner(struct pvsched_session *session,
 	runner->pid = runner_pid;
 	runner->runner_id = runner_id;
 	ret = pvsched_runner_lifecycle_init(runner, session,
-					    session->entry->ops->params_size);
+			pvsched_policy_params_size(session->entry));
 	if (ret) {
 		kfree(runner);
 		runner = NULL;
@@ -504,7 +504,7 @@ int pvsched_session_add_current_runner(struct pvsched_session *session,
 		return -ENOSPC;
 	}
 	ret = pvsched_runner_lifecycle_init(runner, session,
-					    session->entry->ops->params_size);
+			pvsched_policy_params_size(session->entry));
 	if (ret) {
 		kfree(runner);
 		atomic_dec(&pvsched_nr_runners);

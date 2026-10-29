@@ -37,8 +37,8 @@ pvsched_policy_find_locked(const char *name, u32 version)
 
 	lockdep_assert_held(&pvsched_policy_mutex);
 	list_for_each_entry(entry, &pvsched_policies, node) {
-		if (entry->ops->version == version &&
-		    !strncmp(entry->ops->name, name, PVSCHED_NAME_MAX))
+		if (pvsched_policy_version(entry) == version &&
+		    !strncmp(pvsched_policy_name(entry), name, PVSCHED_NAME_MAX))
 			return entry;
 	}
 	return NULL;
@@ -131,10 +131,12 @@ int pvsched_policy_query(u32 index, struct pvsched_policy_info *info)
 	list_for_each_entry(entry, &pvsched_policies, node) {
 		if (index--)
 			continue;
-		memcpy(info->name, entry->ops->name, sizeof(info->name));
-		info->version = entry->ops->version;
-		info->protocol = entry->ops->protocol;
-		info->params_size = entry->ops->params_size;
+		memcpy(info->name, pvsched_policy_name(entry), sizeof(info->name));
+		info->version = pvsched_policy_version(entry);
+		/* An external policy owns everything after the header. */
+		info->protocol = entry->ops ? entry->ops->protocol :
+				 PVSCHED_PROTOCOL_CUSTOM;
+		info->params_size = pvsched_policy_params_size(entry);
 		return 0;
 	}
 	return -ENOENT;
@@ -180,39 +182,34 @@ static bool pvsched_policy_ops_valid(const struct pvsched_policy_ops *ops)
 	       ops->capture_baseline && ops->map && ops->apply;
 }
 
-int __pvsched_register_policy(struct pvsched_policy_ops *ops,
-			      struct module *owner)
+/* List a filled-in entry under its name and version, or -EEXIST. */
+static int pvsched_policy_add(struct pvsched_policy_entry *entry)
 {
-	struct pvsched_policy_entry *entry;
-
-	if (!pvsched_policy_ops_valid(ops))
-		return -EINVAL;
-	entry = kzalloc_obj(*entry);
-	if (!entry)
-		return -ENOMEM;
 	refcount_set(&entry->ref, 1);
-	entry->ops = ops;
-	entry->owner = owner;
-
 	guard(mutex)(&pvsched_policy_mutex);
-	if (pvsched_policy_find_locked(ops->name, ops->version)) {
-		kfree(entry);
+	if (pvsched_policy_find_locked(pvsched_policy_name(entry),
+				       pvsched_policy_version(entry)))
 		return -EEXIST;
-	}
-	ops->owner = owner;
+	/* Set before listing: a session may pin the entry right after. */
+	if (entry->ops)
+		entry->ops->owner = entry->owner;
+	else
+		entry->ext_ops->owner = entry->owner;
 	list_add_tail(&entry->node, &pvsched_policies);
-	pr_info("registered host policy %s v%u\n", ops->name, ops->version);
+	pr_info("registered %s host policy %s v%u\n",
+		entry->kind == PVSCHED_POLICY_EXTERNAL ? "external" : "managed",
+		pvsched_policy_name(entry), pvsched_policy_version(entry));
 	return 0;
 }
-EXPORT_SYMBOL_GPL(__pvsched_register_policy);
 
-void pvsched_unregister_policy(struct pvsched_policy_ops *ops)
+/* Unlist the entry registered with @ops and drop the registry's reference. */
+static void pvsched_policy_remove(const void *ops)
 {
 	struct pvsched_policy_entry *entry, *found = NULL;
 
 	scoped_guard(mutex, &pvsched_policy_mutex) {
 		list_for_each_entry(entry, &pvsched_policies, node) {
-			if (entry->ops == ops) {
+			if (entry->ops == ops || entry->ext_ops == ops) {
 				found = entry;
 				break;
 			}
@@ -222,10 +219,73 @@ void pvsched_unregister_policy(struct pvsched_policy_ops *ops)
 		found->dead = true;
 		list_del_init(&found->node);
 	}
-	pr_info("unregistered host policy %s v%u\n", ops->name, ops->version);
+	pr_info("unregistered host policy %s v%u\n", pvsched_policy_name(found),
+		pvsched_policy_version(found));
 	pvsched_policy_entry_put(found);
 }
+
+int __pvsched_register_policy(struct pvsched_policy_ops *ops,
+			      struct module *owner)
+{
+	struct pvsched_policy_entry *entry;
+	int ret;
+
+	if (!pvsched_policy_ops_valid(ops))
+		return -EINVAL;
+	entry = kzalloc_obj(*entry);
+	if (!entry)
+		return -ENOMEM;
+	entry->kind = PVSCHED_POLICY_MANAGED;
+	entry->ops = ops;
+	entry->owner = owner;
+	ret = pvsched_policy_add(entry);
+	if (ret)
+		kfree(entry);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(__pvsched_register_policy);
+
+void pvsched_unregister_policy(struct pvsched_policy_ops *ops)
+{
+	pvsched_policy_remove(ops);
+}
 EXPORT_SYMBOL_GPL(pvsched_unregister_policy);
+
+static bool pvsched_external_ops_valid(const struct pvsched_external_ops *ops)
+{
+	return pvsched_policy_name_valid(ops->name) &&
+	       (ops->attach || ops->detach || ops->run_enter ||
+		ops->run_leave || ops->vmentry || ops->vmentry_cancel ||
+		ops->vmexit_irqoff || ops->vmexit || ops->halt ||
+		ops->unhalt || ops->inject);
+}
+
+int __pvsched_register_external_policy(struct pvsched_external_ops *ops,
+				       struct module *owner)
+{
+	struct pvsched_policy_entry *entry;
+	int ret;
+
+	if (!pvsched_external_ops_valid(ops))
+		return -EINVAL;
+	entry = kzalloc_obj(*entry);
+	if (!entry)
+		return -ENOMEM;
+	entry->kind = PVSCHED_POLICY_EXTERNAL;
+	entry->ext_ops = ops;
+	entry->owner = owner;
+	ret = pvsched_policy_add(entry);
+	if (ret)
+		kfree(entry);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(__pvsched_register_external_policy);
+
+void pvsched_unregister_external_policy(struct pvsched_external_ops *ops)
+{
+	pvsched_policy_remove(ops);
+}
+EXPORT_SYMBOL_GPL(pvsched_unregister_external_policy);
 
 int pvsched_policy_init(void)
 {

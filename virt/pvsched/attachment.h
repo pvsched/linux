@@ -5,6 +5,7 @@
 #include <linux/hashtable.h>
 #include <linux/bits.h>
 #include <linux/mm_types.h>
+#include <linux/pvsched_external.h>
 #include <linux/sched.h>
 #include <linux/spinlock.h>
 
@@ -21,11 +22,16 @@
  * runtime engine.
  */
 
+/*
+ * The positions external policies see, by their internal names.  A position
+ * only pvsched knows would go after a gap, and be mapped to one of these
+ * before an external policy sees it.
+ */
 enum pvsched_runner_position {
-	PVSCHED_RUNNER_HOST,
-	PVSCHED_RUNNER_BLOCKED,
-	PVSCHED_RUNNER_GUEST,
-	PVSCHED_RUNNER_VMM,
+	PVSCHED_RUNNER_HOST	= PVSCHED_VCPU_HOST,
+	PVSCHED_RUNNER_BLOCKED	= PVSCHED_VCPU_BLOCKED,
+	PVSCHED_RUNNER_GUEST	= PVSCHED_VCPU_GUEST,
+	PVSCHED_RUNNER_VMM	= PVSCHED_VCPU_VMM,
 };
 
 /* Architecture adapters translate their factual target-mode bits here. */
