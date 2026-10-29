@@ -40,6 +40,11 @@
  * of a task that stays current, new tasks (sched_wakeup_new), and the idle
  * task, which publishes as NORMAL nice 0.
  *
+ * A kernel built with the guest side of an external host policy publishes
+ * none of the above: the core keeps its hooks and calls the policy's in
+ * their place, with the policy's part of the page.  It negotiates only for
+ * that policy's name and version, and the policy's protocol is its own.
+ *
  * Hooks run only after the host enabled at least one vCPU, and each checks its
  * own page's status, so a guest with this support runs unchanged elsewhere.
  * Pages are allocated once and never freed, so a renegotiation reuses them
@@ -82,6 +87,14 @@ static DEFINE_MUTEX(pvsched_guest_mutex);
 static bool pvsched_publishing;
 /* The CPUs whose pages the last prepare reset: the set handed to the VMM. */
 static struct cpumask pvsched_prepared_cpus;
+
+/* The built-in guest external policy, in place of the default protocol. */
+#define pvsched_has_ext_policy	(!IS_ENABLED(CONFIG_PVSCHED_GUEST_DEFAULT))
+#if IS_ENABLED(CONFIG_PVSCHED_GUEST_DEFAULT)
+#define pvsched_ext_policy	((const struct pvsched_guest_ext_policy *)NULL)
+#else
+#define pvsched_ext_policy	(&pvsched_guest_ext_policy)
+#endif
 
 static char pvsched_policy[PVSCHED_NAME_MAX];
 static u32 pvsched_policy_version;
@@ -160,6 +173,37 @@ static void pvsched_guest_do_kick(void)
 		__this_cpu_inc(pvsched_kicks);
 		kick();
 	}
+}
+
+void pvsched_guest_kick(void)
+{
+	pvsched_guest_do_kick();
+}
+
+/* The guest external policy's part of an enabled page. */
+static void *pvsched_guest_opaque(union pvsched_vcpu_page *page)
+{
+	return page->opaque;
+}
+
+void *pvsched_guest_area(unsigned int cpu)
+{
+	union pvsched_vcpu_page *page = per_cpu(pvsched_page, cpu);
+
+	return pvsched_guest_active(page) ? pvsched_guest_opaque(page) : NULL;
+}
+
+/* sched_switch for a guest external policy, in the default's context. */
+static void pvsched_guest_ext_switch_probe(void *data, bool preempt,
+					   struct task_struct *prev,
+					   struct task_struct *next,
+					   unsigned int prev_state)
+{
+	union pvsched_vcpu_page *page = __this_cpu_read(pvsched_page);
+
+	if (pvsched_guest_active(page))
+		pvsched_guest_ext_policy_sched_switch(pvsched_guest_opaque(page),
+						      prev, next);
 }
 
 /* sched_switch: under this CPU's runqueue lock, with IRQs disabled. */
@@ -264,6 +308,10 @@ void __pvsched_guest_cs_update(void)
 
 	if (!pvsched_guest_active(page))
 		return;
+	if (pvsched_has_ext_policy) {
+		pvsched_guest_ext_policy_cs_update(pvsched_guest_opaque(page));
+		return;
+	}
 	cs = pvsched_guest_cs_now();
 	pvsched_guest_publish_cs(page, cs);
 
@@ -295,10 +343,45 @@ void __pvsched_guest_cs_update(void)
 		pvsched_guest_do_kick();
 }
 
+static int pvsched_guest_ext_start(void)
+{
+	int ret;
+
+	ret = pvsched_guest_ext_policy_start();
+	if (ret)
+		return ret;
+	if (pvsched_ext_policy->sched_switch) {
+		ret = register_trace_sched_switch(pvsched_guest_ext_switch_probe,
+						  NULL);
+		if (ret) {
+			pvsched_guest_ext_policy_stop();
+			return ret;
+		}
+	}
+	if (pvsched_ext_policy->cs_update)
+		static_branch_enable(&pvsched_guest_irq_key);
+	return 0;
+}
+
+static void pvsched_guest_ext_stop(void)
+{
+	static_branch_disable(&pvsched_guest_irq_key);
+	if (pvsched_ext_policy->sched_switch) {
+		unregister_trace_sched_switch(pvsched_guest_ext_switch_probe,
+					      NULL);
+		tracepoint_synchronize_unregister();
+	}
+	/* As below: no interrupt hook still runs. */
+	synchronize_rcu();
+	pvsched_guest_ext_policy_stop();
+}
+
 static int pvsched_guest_start(void)
 {
 	int ret;
 
+	if (pvsched_has_ext_policy)
+		return pvsched_guest_ext_start();
 	ret = register_trace_sched_switch(pvsched_guest_switch_probe, NULL);
 	if (ret)
 		return ret;
@@ -314,6 +397,10 @@ static int pvsched_guest_start(void)
 
 static void pvsched_guest_stop(void)
 {
+	if (pvsched_has_ext_policy) {
+		pvsched_guest_ext_stop();
+		return;
+	}
 	static_branch_disable(&pvsched_guest_irq_key);
 	unregister_trace_sched_wakeup(pvsched_guest_wakeup_probe, NULL);
 	unregister_trace_sched_switch(pvsched_guest_switch_probe, NULL);
@@ -360,8 +447,13 @@ static void pvsched_guest_reset_page(union pvsched_vcpu_page *page)
 	header->policy_version = cpu_to_le32(pvsched_policy_version);
 	strscpy_pad(header->policy_name, pvsched_policy,
 		    sizeof(header->policy_name));
-	header->protocol_id = cpu_to_le32(PVSCHED_PROTOCOL_DEFAULT);
-	header->requested_mode = cpu_to_le32(PVSCHED_MODE_FRAMEWORK);
+	if (pvsched_has_ext_policy) {
+		header->protocol_id = cpu_to_le32(PVSCHED_PROTOCOL_CUSTOM);
+		header->requested_mode = cpu_to_le32(PVSCHED_MODE_POLICY);
+	} else {
+		header->protocol_id = cpu_to_le32(PVSCHED_PROTOCOL_DEFAULT);
+		header->requested_mode = cpu_to_le32(PVSCHED_MODE_FRAMEWORK);
+	}
 }
 
 int pvsched_guest_prepare(const char *policy, u32 policy_version,
@@ -385,6 +477,16 @@ int pvsched_guest_prepare(const char *policy, u32 policy_version,
 	if (!pvsched_guest_allowed(policy, policy_version)) {
 		pr_info("advertised policy '%s' v%u not accepted (pvsched_guest.allow=%s)\n",
 			policy, policy_version, pvsched_allow);
+		ret = -EPERM;
+		goto out;
+	}
+	/* It serves only its own host policy; stay inert otherwise. */
+	if (pvsched_has_ext_policy &&
+	    (strcmp(policy, pvsched_ext_policy->name) ||
+	     policy_version != pvsched_ext_policy->version)) {
+		pr_info("advertised policy '%s' v%u is not this kernel's external policy '%s' v%u\n",
+			policy, policy_version, pvsched_ext_policy->name,
+			pvsched_ext_policy->version);
 		ret = -EPERM;
 		goto out;
 	}
@@ -470,6 +572,19 @@ static int pvsched_guest_state_show(struct seq_file *m, void *v)
 {
 	unsigned int cpu;
 
+	/* The policy's words are its own; show where each vCPU stands. */
+	if (pvsched_has_ext_policy) {
+		seq_puts(m, "cpu status kicks\n");
+		for_each_present_cpu(cpu) {
+			union pvsched_vcpu_page *page = per_cpu(pvsched_page, cpu);
+
+			if (page)
+				seq_printf(m, "%u %u %llu\n", cpu,
+					   le32_to_cpu(READ_ONCE(page->header.status)),
+					   per_cpu(pvsched_kicks, cpu));
+		}
+		return 0;
+	}
 	seq_puts(m, "cpu status intent cs_state ack hints flags boost ticket kicks acks\n");
 	for_each_present_cpu(cpu) {
 		union pvsched_vcpu_page *page = per_cpu(pvsched_page, cpu);

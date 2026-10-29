@@ -94,6 +94,24 @@ config PARAVIRT_SCHED_GUEST
 
 	  If unsure, say N.
 
+choice
+	prompt "What the pvsched guest publishes"
+	depends on PARAVIRT_SCHED_GUEST
+	default PVSCHED_GUEST_DEFAULT
+	help
+	  A guest publishes for one host policy, chosen here.  Against a host
+	  that runs another policy, the guest negotiates nothing and runs
+	  unchanged.
+
+config PVSCHED_GUEST_DEFAULT
+	bool "The default policy"
+	help
+	  Publish task intent, interrupt state and interrupt acknowledgments
+	  in the default protocol, for the host's built-in default policy and
+	  any other policy that uses that protocol.
+
+endchoice
+
 config PVSCHED_GUEST_PCI
 	tristate "pvsched guest PCI transport"
 	depends on PARAVIRT_SCHED_GUEST && PCI

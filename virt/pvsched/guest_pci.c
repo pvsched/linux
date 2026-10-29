@@ -76,7 +76,10 @@ static int pvsched_pci_probe(struct pci_dev *pdev,
 
 	ret = pvsched_guest_prepare(policy, policy_version, pvsched_pci_kick);
 	if (ret == -EPERM) {
-		/* Declined by the guest's acceptance list: bound but inert. */
+		/*
+		 * Declined by the guest's acceptance list, or not the policy
+		 * this kernel's external policy serves: bound but inert.
+		 */
 		return 0;
 	}
 	if (ret)
