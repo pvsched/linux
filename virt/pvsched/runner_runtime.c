@@ -1279,6 +1279,7 @@ void pvsched_runner_local_guest_exit_irqoff(const void *vcpu_key)
 	pvsched_attachment_local_irqoff_visit(vcpu_key,
 				pvsched_runner_guest_exit_irqoff_visit, NULL);
 }
+EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_local_guest_exit_irqoff);
 
 void pvsched_runner_guest_exit_irqoff(struct pvsched_runner_runtime *runtime)
 {
