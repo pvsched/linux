@@ -31,10 +31,10 @@ pvsched_default_guest_area_valid(const struct pvsched_default_guest_area *guest)
 	return pvsched_zero_bytes(guest->reserved, sizeof(guest->reserved));
 }
 
-enum pvsched_status
-pvsched_negotiate(const struct pvsched_negotiation_request *request,
-		  const struct pvsched_default_guest_area *guest,
-		  const struct pvsched_policy_ops *ops)
+/* The checks every policy shares, in their ABI order. */
+static enum pvsched_status
+pvsched_negotiate_request(const struct pvsched_negotiation_request *request,
+			  const char *name, u32 version, u32 protocol, u32 mode)
 {
 	/* The rejection order is part of the ABI; keep it deterministic. */
 	if (request->abi_version != PVSCHED_ABI_VERSION)
@@ -42,14 +42,29 @@ pvsched_negotiate(const struct pvsched_negotiation_request *request,
 	if (!pvsched_policy_name_valid(request->policy_name))
 		return PVSCHED_STATUS_DISABLED;
 	/* A guest cannot switch its session to another policy. */
-	if (strcmp(request->policy_name, ops->name))
+	if (strcmp(request->policy_name, name))
 		return PVSCHED_STATUS_UNKNOWN_POLICY;
-	if (request->policy_version != ops->version)
+	if (request->policy_version != version)
 		return PVSCHED_STATUS_POLICY_VERSION_MISMATCH;
-	if (request->protocol_id != ops->protocol)
+	if (request->protocol_id != protocol)
 		return PVSCHED_STATUS_PROTOCOL_MISMATCH;
-	if (request->requested_mode != PVSCHED_MODE_FRAMEWORK)
+	if (request->requested_mode != mode)
 		return PVSCHED_STATUS_MODE_MISMATCH;
+	return PVSCHED_STATUS_ENABLED;
+}
+
+enum pvsched_status
+pvsched_negotiate(const struct pvsched_negotiation_request *request,
+		  const struct pvsched_default_guest_area *guest,
+		  const struct pvsched_policy_ops *ops)
+{
+	enum pvsched_status status;
+
+	status = pvsched_negotiate_request(request, ops->name, ops->version,
+					   ops->protocol,
+					   PVSCHED_MODE_FRAMEWORK);
+	if (status != PVSCHED_STATUS_ENABLED)
+		return status;
 	if (!pvsched_default_guest_area_valid(guest))
 		return PVSCHED_STATUS_DISABLED;
 	/* The policy's own checks come last. */
@@ -58,3 +73,14 @@ pvsched_negotiate(const struct pvsched_negotiation_request *request,
 	return PVSCHED_STATUS_ENABLED;
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_negotiate);
+
+enum pvsched_status
+pvsched_negotiate_external(const struct pvsched_negotiation_request *request,
+			   const struct pvsched_policy_entry *entry)
+{
+	return pvsched_negotiate_request(request, entry->ext_ops->name,
+					 entry->ext_ops->version,
+					 PVSCHED_PROTOCOL_CUSTOM,
+					 PVSCHED_MODE_POLICY);
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_negotiate_external);

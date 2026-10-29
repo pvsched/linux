@@ -23,11 +23,16 @@ void pvsched_shm_bridge_snapshot(const struct pvsched_shm *shm,
 				 struct pvsched_default_guest_area *guest);
 void pvsched_shm_bridge_publish_vmentry(const struct pvsched_shm *shm,
 					 const struct pvsched_host_area *host);
+void pvsched_shm_bridge_read_request(const struct pvsched_shm *shm,
+				     struct pvsched_negotiation_request *request);
 void pvsched_shm_bridge_read_negotiation(const struct pvsched_shm *shm,
 					  struct pvsched_negotiation_request *request,
 					  struct pvsched_default_guest_area *guest);
 void pvsched_shm_bridge_publish_response(const struct pvsched_shm *shm,
 					  enum pvsched_status status);
+/* An external policy's response: the header only, with POLICY mode. */
+void pvsched_shm_bridge_publish_external_response(const struct pvsched_shm *shm,
+						   enum pvsched_status status);
 void pvsched_shm_bridge_publish_status(const struct pvsched_shm *shm,
 				       enum pvsched_status status);
 

@@ -8,6 +8,7 @@
 
 #include "internal.h"
 #include "event_service.h"
+#include "external.h"
 #include "lifecycle.h"
 #include "negotiation.h"
 #include "shm_bridge.h"
@@ -163,10 +164,13 @@ int pvsched_runner_publish_runtime_locked(struct pvsched_vcpu_runner *runner,
 
 	if (runner->runtime)
 		return -EEXIST;
-	if (WARN_ON_ONCE(runtime->ops->params_size != runner->baseline_size))
-		return -EINVAL;
-	if (pvsched_runner_baseline_differs(runner, runtime))
-		return -EBUSY;
+	if (!runtime->attachment.external) {
+		if (WARN_ON_ONCE(runtime->ops->params_size !=
+				 runner->baseline_size))
+			return -EINVAL;
+		if (pvsched_runner_baseline_differs(runner, runtime))
+			return -EBUSY;
+	}
 	runtime->attachment.runner = runner;
 	if (runner->last_fault_valid)
 		runtime->last_fault = runner->last_fault;
@@ -178,7 +182,7 @@ int pvsched_runner_publish_runtime_locked(struct pvsched_vcpu_runner *runner,
 		pvsched_event_service_put();
 		return ret;
 	}
-	if (!runner->baseline_valid) {
+	if (!runner->baseline_valid && !runtime->attachment.external) {
 		memcpy(runner->baseline, runtime->baseline, runner->baseline_size);
 		runner->baseline_valid = true;
 	}
@@ -316,9 +320,6 @@ int pvsched_runner_prepare_attach_locked(struct pvsched_vcpu_runner *runner,
 	lockdep_assert_held(&runner->session->lock);
 	if (runner->runtime)
 		return -EEXIST;
-	/* External policies cannot be attached yet. */
-	if (params->entry->kind != PVSCHED_POLICY_MANAGED)
-		return -EOPNOTSUPP;
 	runtime = kzalloc(sizeof(*runtime), GFP_KERNEL_ACCOUNT);
 	if (!runtime)
 		return -ENOMEM;
@@ -341,13 +342,15 @@ int pvsched_runner_prepare_attach_locked(struct pvsched_vcpu_runner *runner,
 	}
 	/*
 	 * The capture is compared here, before a page is pinned, and copied into
-	 * the runner only at publish.
+	 * the runner only at publish.  An external policy captures nothing.
 	 */
-	if (runtime->ops->params_size != runner->baseline_size) {
+	if (!runtime->attachment.external &&
+	    runtime->ops->params_size != runner->baseline_size) {
 		ret = -EINVAL;
 		goto err_discard;
 	}
-	if (pvsched_runner_baseline_differs(runner, runtime)) {
+	if (!runtime->attachment.external &&
+	    pvsched_runner_baseline_differs(runner, runtime)) {
 		ret = -EBUSY;
 		goto err_discard;
 	}
@@ -361,8 +364,15 @@ int pvsched_runner_prepare_attach_locked(struct pvsched_vcpu_runner *runner,
 				  params->memlock_limit_pages);
 	if (ret)
 		goto err_discard;
-	pvsched_shm_bridge_read_negotiation(shm, &request, &guest);
-	runtime->negotiation = pvsched_negotiate(&request, &guest, runtime->ops);
+	if (runtime->attachment.external) {
+		pvsched_shm_bridge_read_request(shm, &request);
+		runtime->negotiation = pvsched_negotiate_external(&request,
+								  runtime->entry);
+	} else {
+		pvsched_shm_bridge_read_negotiation(shm, &request, &guest);
+		runtime->negotiation = pvsched_negotiate(&request, &guest,
+							 runtime->ops);
+	}
 	*status = runtime->negotiation;
 	*prepared = runtime;
 	return 0;
@@ -382,15 +392,36 @@ static void pvsched_runner_commit_enabled(struct pvsched_attachment *attachment,
 					    PVSCHED_STATUS_ENABLED);
 }
 
-/* Publish a prepared runtime; only an ENABLED negotiation may serve. */
+static void pvsched_runner_commit_external(struct pvsched_attachment *attachment,
+					   void *data)
+{
+	pvsched_shm_bridge_publish_external_response(&attachment->shm,
+						     PVSCHED_STATUS_ENABLED);
+}
+
+/*
+ * Publish a prepared runtime; only an ENABLED negotiation may serve.  An
+ * external policy's attach op runs first, with the page pinned; if
+ * publication then fails, its detach op runs before the caller discards.
+ */
 int pvsched_runner_publish_prepared_locked(struct pvsched_vcpu_runner *runner,
 					   struct pvsched_runner_runtime *runtime)
 {
+	int ret;
+
 	if (WARN_ON_ONCE(runtime->negotiation != PVSCHED_STATUS_ENABLED))
 		return -EINVAL;
-	return pvsched_runner_publish_runtime_locked(runner, runtime,
-						     pvsched_runner_commit_enabled,
-						     NULL);
+	if (!runtime->attachment.external)
+		return pvsched_runner_publish_runtime_locked(runner, runtime,
+						pvsched_runner_commit_enabled, NULL);
+	ret = pvsched_external_attach(runtime, runner);
+	if (ret)
+		return ret;
+	ret = pvsched_runner_publish_runtime_locked(runner, runtime,
+					pvsched_runner_commit_external, NULL);
+	if (ret)
+		pvsched_external_detach(runtime);
+	return ret;
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_publish_prepared_locked);
 
@@ -406,9 +437,18 @@ EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_discard_prepared_locked);
 /* Publish the completed rejection on the page, then undo the preparation. */
 void pvsched_runner_reject_prepared_locked(struct pvsched_runner_runtime *runtime)
 {
-	if (!WARN_ON_ONCE(runtime->negotiation == PVSCHED_STATUS_ENABLED))
-		pvsched_shm_bridge_publish_response(&runtime->attachment.shm,
-						    runtime->negotiation);
+	const struct pvsched_shm *shm = &runtime->attachment.shm;
+	enum pvsched_status status = runtime->negotiation;
+
+	if (status != PVSCHED_STATUS_ENABLED) {
+		if (runtime->attachment.external)
+			pvsched_shm_bridge_publish_external_response(shm, status);
+		else
+			pvsched_shm_bridge_publish_response(shm, status);
+	} else {
+		/* A caller bug: never tell the guest ENABLED here. */
+		WARN_ON_ONCE(1);
+	}
 	pvsched_runner_discard_prepared_locked(runtime);
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_reject_prepared_locked);

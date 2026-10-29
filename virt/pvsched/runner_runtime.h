@@ -7,6 +7,7 @@
 #include <linux/hrtimer.h>
 #include <linux/irq_work.h>
 #include <linux/spinlock.h>
+#include <linux/pvsched_external.h>
 #include <linux/pvsched_policy.h>
 #include <uapi/linux/pvsched.h>
 
@@ -38,9 +39,20 @@ struct pvsched_ticket_owner {
 struct pvsched_runner_runtime {
 	/* Common attachment identity, admission, position and state lock. */
 	struct pvsched_attachment attachment;
-	/* Counted registry entry of the bound policy, and its ops. */
+	/*
+	 * Counted registry entry of the bound policy, and its ops: ops for a
+	 * managed policy, ext_ops for an external one.  An external runtime
+	 * uses none of the managed state below.
+	 */
 	struct pvsched_policy_entry *entry;
 	const struct pvsched_policy_ops *ops;
+	const struct pvsched_external_ops *ext_ops;
+	/* An external policy's view of this vCPU. */
+	struct pvsched_vcpu ext_vcpu;
+	/* Under the state lock: an external op may write the area now. */
+	bool ext_writable;
+	/* The external attach op succeeded and detach is still owed. */
+	bool ext_attached;
 	/* The policy's view of this vCPU; its buffers are allocated below. */
 	struct pvsched_policy_ctx ctx;
 	/*

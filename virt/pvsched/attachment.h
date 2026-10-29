@@ -82,6 +82,8 @@ struct pvsched_attachment {
 	enum pvsched_runner_position position;
 	/* Ordinary service admission, opened only by successful publication. */
 	bool active;
+	/* Bound to an external policy, whose ops pvsched calls; fixed. */
+	bool external;
 	/* Task exit was observed, so scheduler restoration is unsafe. */
 	bool exited;
 	/* A missing or changed vCPU key permanently failed this binding. */

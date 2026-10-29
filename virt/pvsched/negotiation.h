@@ -4,6 +4,7 @@
 
 #include <uapi/linux/pvsched.h>
 
+#include "policy.h"
 #include "shm_bridge.h"
 
 /*
@@ -17,5 +18,15 @@ enum pvsched_status
 pvsched_negotiate(const struct pvsched_negotiation_request *request,
 		  const struct pvsched_default_guest_area *guest,
 		  const struct pvsched_policy_ops *ops);
+
+/*
+ * Decide the negotiation for the session's external policy @entry: the same
+ * name, version, protocol and mode checks, with the CUSTOM protocol and
+ * POLICY mode.  pvsched does not look at the rest of the page, which
+ * belongs to the policy.
+ */
+enum pvsched_status
+pvsched_negotiate_external(const struct pvsched_negotiation_request *request,
+			   const struct pvsched_policy_entry *entry);
 
 #endif /* _VIRT_PVSCHED_NEGOTIATION_H */

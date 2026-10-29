@@ -11,6 +11,7 @@
 #include <linux/string.h>
 #include <kunit/visibility.h>
 #include "runner_runtime.h"
+#include "external.h"
 #include "shm_bridge.h"
 #include "lifecycle.h"
 
@@ -413,6 +414,11 @@ int pvsched_runner_runtime_prepare(struct pvsched_runner_runtime *runtime,
 		return ret;
 	runtime->ticket_owner = ticket_owner;
 	runtime->deboost_notify = deboost_notify;
+	if (entry->kind == PVSCHED_POLICY_EXTERNAL) {
+		/* No baseline, no budgets: the policy owns all of that. */
+		pvsched_external_prepare(runtime, entry);
+		return 0;
+	}
 	ret = pvsched_runner_policy_bind(runtime, entry);
 	if (ret)
 		goto err_put;
@@ -452,7 +458,7 @@ void pvsched_runner_runtime_disable(struct pvsched_runner_runtime *runtime)
 	int ret;
 
 	raw_spin_lock_irqsave(&runtime->attachment.state_lock, flags);
-	if (!runtime->closing) {
+	if (!runtime->closing && !runtime->attachment.external) {
 		sample = pvsched_sample(runtime, true);
 		ret = pvsched_runtime_guest_close(&runtime->accounting, sample);
 		WARN_ON_ONCE(ret);
@@ -481,6 +487,14 @@ pvsched_runner_runtime_finish_close(struct pvsched_runner_runtime *runtime,
 
 	/* Admission must be disabled before synchronously waiting for callbacks. */
 	WARN_ON_ONCE(!runtime->closing);
+	/*
+	 * pvsched never changed an external policy's task; the policy restores
+	 * what it changed in detach, its last op, here where no other runs.
+	 */
+	if (runtime->attachment.external) {
+		pvsched_external_detach(runtime);
+		return PVSCHED_RESTORE_RESTORED;
+	}
 
 	raw_spin_lock_irqsave(&runtime->attachment.state_lock, flags);
 	/* sched_process_exit makes scheduler restoration both unsafe and moot. */
@@ -519,6 +533,8 @@ EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_runtime_unhash);
 
 void pvsched_runner_runtime_release(struct pvsched_runner_runtime *runtime)
 {
+	/* Every teardown and failed publication has called detach. */
+	WARN_ON_ONCE(runtime->ext_attached);
 	pvsched_attachment_release(&runtime->attachment);
 	kfree(runtime->baseline);
 	runtime->baseline = NULL;
@@ -1014,6 +1030,9 @@ pvsched_runner_remote_inject_visit(struct pvsched_attachment *attachment,
 
 	if (kind != PVSCHED_ATTACHMENT_VISIT_ORDINARY)
 		return;
+	/* Disabled until the external policy's ops are plugged in. */
+	if (attachment->external)
+		return;
 	if (attachment->position == PVSCHED_RUNNER_HOST &&
 	    !task_is_runnable(attachment->task))
 		return;
@@ -1096,6 +1115,12 @@ pvsched_runner_local_event_visit(struct pvsched_attachment *attachment,
 	struct pvsched_host_area staged = { };
 	bool published = false;
 
+	if (attachment->external) {
+		pvsched_external_local_event_locked(runtime, kind,
+						    ctx->mode_flags);
+		ctx->ret = 0;
+		return;
+	}
 	/* A failed binding is reported, not recorded as the runner's fault. */
 	if (kind == PVSCHED_ATTACHMENT_VISIT_BINDING_FAILED)
 		runtime->restore_owed_error = -ESTALE;
@@ -1188,6 +1213,9 @@ pvsched_runner_guest_exit_irqoff_visit(struct pvsched_attachment *attachment,
 	struct pvsched_runner_runtime *runtime =
 		container_of(attachment, struct pvsched_runner_runtime, attachment);
 
+	/* Disabled until the external policy's ops are plugged in. */
+	if (attachment->external)
+		return;
 	pvsched_runner_guest_exit_irqoff(runtime);
 }
 

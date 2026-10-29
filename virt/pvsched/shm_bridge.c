@@ -36,9 +36,8 @@ void pvsched_shm_bridge_publish_vmentry(const struct pvsched_shm *shm,
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_shm_bridge_publish_vmentry);
 
-void pvsched_shm_bridge_read_negotiation(const struct pvsched_shm *shm,
-					  struct pvsched_negotiation_request *request,
-					  struct pvsched_default_guest_area *guest)
+void pvsched_shm_bridge_read_request(const struct pvsched_shm *shm,
+				     struct pvsched_negotiation_request *request)
 {
 	const union pvsched_vcpu_page *page = shm->addr;
 	const struct pvsched_header *header = &page->header;
@@ -50,29 +49,55 @@ void pvsched_shm_bridge_read_negotiation(const struct pvsched_shm *shm,
 	       sizeof(request->policy_name));
 	request->protocol_id = le32_to_cpu(READ_ONCE(header->protocol_id));
 	request->requested_mode = le32_to_cpu(READ_ONCE(header->requested_mode));
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_shm_bridge_read_request);
+
+void pvsched_shm_bridge_read_negotiation(const struct pvsched_shm *shm,
+					  struct pvsched_negotiation_request *request,
+					  struct pvsched_default_guest_area *guest)
+{
+	pvsched_shm_bridge_read_request(shm, request);
 	pvsched_shm_bridge_snapshot(shm, guest);
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_shm_bridge_read_negotiation);
+
+/* The header's response fields; the status store is last and releases. */
+static void pvsched_shm_bridge_publish_header(union pvsched_vcpu_page *page,
+					      enum pvsched_status status,
+					      enum pvsched_mode mode)
+{
+	struct pvsched_header *header = &page->header;
+
+	WRITE_ONCE(header->host_abi_version, cpu_to_le32(PVSCHED_ABI_VERSION));
+	WRITE_ONCE(header->accepted_mode, cpu_to_le32(mode));
+	WRITE_ONCE(header->reserved, 0);
+	smp_store_release(&header->status, cpu_to_le32(status));
+}
 
 void pvsched_shm_bridge_publish_response(const struct pvsched_shm *shm,
 					  enum pvsched_status status)
 {
 	union pvsched_vcpu_page *page = shm->addr;
-	struct pvsched_header *header = &page->header;
 
 	/*
 	 * Host-owned storage is rewritten rather than trusted: zero feedback,
 	 * ticket, reserved host bytes and extension storage, then fill the
-	 * response.  The status store is last and releases all of it.
+	 * response, which releases all of it.
 	 */
 	memset(&page->host_area, 0, sizeof(page->host_area));
 	memset(page->extension, 0, sizeof(page->extension));
-	WRITE_ONCE(header->host_abi_version, cpu_to_le32(PVSCHED_ABI_VERSION));
-	WRITE_ONCE(header->accepted_mode, cpu_to_le32(PVSCHED_MODE_FRAMEWORK));
-	WRITE_ONCE(header->reserved, 0);
-	smp_store_release(&header->status, cpu_to_le32(status));
+	pvsched_shm_bridge_publish_header(page, status, PVSCHED_MODE_FRAMEWORK);
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_shm_bridge_publish_response);
+
+void pvsched_shm_bridge_publish_external_response(const struct pvsched_shm *shm,
+						   enum pvsched_status status)
+{
+	/* The rest of the page is the external policy's; leave it alone. */
+	pvsched_shm_bridge_publish_header(shm->addr, status,
+					  PVSCHED_MODE_POLICY);
+}
+EXPORT_SYMBOL_IF_KUNIT(pvsched_shm_bridge_publish_external_response);
 
 void pvsched_shm_bridge_publish_status(const struct pvsched_shm *shm,
 				       enum pvsched_status status)
