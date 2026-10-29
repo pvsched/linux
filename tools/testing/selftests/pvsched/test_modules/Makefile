@@ -6,6 +6,8 @@ obj-m += pvsched-hook-observer.o
 pvsched-hook-observer-y := hook_observer.o
 obj-m += pvsched-sample-nice.o
 pvsched-sample-nice-y := sample_nice.o
+obj-m += pvsched-record.o
+pvsched-record-y := record.o
 
 # Ensure that KDIR exists, otherwise skip the compilation
 modules:

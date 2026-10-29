@@ -110,6 +110,14 @@ config PVSCHED_GUEST_DEFAULT
 	  in the default protocol, for the host's built-in default policy and
 	  any other policy that uses that protocol.
 
+config PVSCHED_GUEST_RECORD
+	bool "The record example external policy"
+	help
+	  Count each vCPU's context switches and hardirq events for the
+	  "record" example external host policy, a pvsched selftest module,
+	  which records them without changing any scheduling.  An example
+	  of a guest external policy; not useful otherwise.
+
 endchoice
 
 config PVSCHED_GUEST_PCI
