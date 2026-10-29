@@ -1329,7 +1329,7 @@ static void pvsched_runner_remote_unsupported_is_record_only_test(struct kunit *
 	anchor_wall = ctx->runtime.accounting.anchor.wall_ns;
 	memcpy(&applied, ctx->runtime.applied, sizeof(applied));
 	KUNIT_ASSERT_EQ(test, pvsched_runner_test_event(ctx,
-		PVSCHED_RECONCILE_INJECT, NULL, PVSCHED_RUNNER_QEMU,
+		PVSCHED_RECONCILE_INJECT, NULL, PVSCHED_RUNNER_VMM,
 		PVSCHED_RUNNER_MODE_UNSUPPORTED), 0);
 	KUNIT_EXPECT_FALSE(test, ctx->runtime.revoke_pending);
 	KUNIT_EXPECT_EQ(test, ctx->runtime.interrupt_ticket, 7ULL);
@@ -1368,7 +1368,7 @@ static void pvsched_runner_position_is_target_owned_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, pvsched_runner_reconcile(&ctx->runtime,
 		PVSCHED_RECONCILE_INJECT, &inject), 0);
 	KUNIT_EXPECT_EQ(test, ctx->runtime.attachment.position,
-			PVSCHED_RUNNER_QEMU);
+			PVSCHED_RUNNER_VMM);
 	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters);
 	KUNIT_EXPECT_EQ(test, ctx->runtime.reasons, 0UL);
 
@@ -1406,7 +1406,7 @@ static void pvsched_runner_local_inject_refused_without_mutation_test(struct kun
 	KUNIT_EXPECT_EQ(test, pvsched_runner_local_event(&key,
 		PVSCHED_RECONCILE_INJECT, 0, false, false), -EINVAL);
 	KUNIT_EXPECT_EQ(test, ctx->runtime.attachment.position,
-			PVSCHED_RUNNER_QEMU);
+			PVSCHED_RUNNER_VMM);
 	KUNIT_EXPECT_EQ(test, ctx->runtime.accounting.anchor.wall_ns,
 			anchor_wall);
 	KUNIT_EXPECT_MEMEQ(test, ctx->runtime.applied, &applied,
@@ -2093,7 +2093,7 @@ static void pvsched_runner_unsupported_run_leave_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, pvsched_runner_test_reconcile(&ctx->runtime,
 		PVSCHED_RECONCILE_RUN_ENTER, &guest), 0);
 	KUNIT_EXPECT_EQ(test, pvsched_runner_test_event(ctx,
-		PVSCHED_RECONCILE_RUN_LEAVE, &guest, PVSCHED_RUNNER_QEMU,
+		PVSCHED_RECONCILE_RUN_LEAVE, &guest, PVSCHED_RUNNER_VMM,
 		PVSCHED_RUNNER_MODE_UNSUPPORTED), -EOPNOTSUPP);
 	KUNIT_EXPECT_FALSE(test, ctx->runtime.attachment.active);
 	pvsched_runner_expect_state(test, ctx->task, SCHED_NORMAL, 5, 0);
@@ -2339,7 +2339,7 @@ static void pvsched_runner_inject_eligibility_matrix_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, pvsched_runner_test_event(ctx,
 		PVSCHED_RECONCILE_INJECT, NULL, PVSCHED_RUNNER_GUEST, 0), 0);
 	KUNIT_ASSERT_EQ(test, pvsched_runner_test_event(ctx,
-		PVSCHED_RECONCILE_INJECT, NULL, PVSCHED_RUNNER_QEMU, 0), 0);
+		PVSCHED_RECONCILE_INJECT, NULL, PVSCHED_RUNNER_VMM, 0), 0);
 	KUNIT_EXPECT_EQ(test, pvsched_runner_test_setter_calls(test), setters);
 	ctx->runtime.reasons = 0;
 	guest.reserved[0] = 1;

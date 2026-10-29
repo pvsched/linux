@@ -25,7 +25,7 @@ enum pvsched_runner_position {
 	PVSCHED_RUNNER_HOST,
 	PVSCHED_RUNNER_BLOCKED,
 	PVSCHED_RUNNER_GUEST,
-	PVSCHED_RUNNER_QEMU,
+	PVSCHED_RUNNER_VMM,
 };
 
 /* Architecture adapters translate their factual target-mode bits here. */

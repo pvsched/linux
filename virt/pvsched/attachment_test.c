@@ -162,7 +162,7 @@ static void pvsched_attachment_run_boundary_disable_test(struct kunit *test)
 		return;
 	found = pvsched_attachment_test_local(&key, PVSCHED_RUNNER_HOST, NULL);
 	KUNIT_ASSERT_TRUE(test, found);
-	found = pvsched_attachment_test_local(&key, PVSCHED_RUNNER_QEMU, NULL);
+	found = pvsched_attachment_test_local(&key, PVSCHED_RUNNER_VMM, NULL);
 	KUNIT_ASSERT_TRUE(test, found);
 	visited = pvsched_attachment_test_remote(&key, true, false,
 						 &ctx->visits);

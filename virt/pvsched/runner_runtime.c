@@ -1171,7 +1171,7 @@ int pvsched_runner_local_event(const void *vcpu_key,
 	else if (event == PVSCHED_RECONCILE_HALT)
 		position = PVSCHED_RUNNER_BLOCKED;
 	else if (event == PVSCHED_RECONCILE_RUN_LEAVE)
-		position = PVSCHED_RUNNER_QEMU;
+		position = PVSCHED_RUNNER_VMM;
 	else
 		position = PVSCHED_RUNNER_HOST;
 	pvsched_attachment_local_visit(vcpu_key, position, mode_flags,

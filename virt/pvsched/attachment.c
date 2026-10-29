@@ -82,7 +82,7 @@ int pvsched_attachment_init(struct pvsched_attachment *attachment,
 	attachment->task = task;
 	attachment->owner_mm = owner_mm;
 	attachment->owner_tgid = owner_tgid;
-	attachment->position = PVSCHED_RUNNER_QEMU;
+	attachment->position = PVSCHED_RUNNER_VMM;
 	attachment->vcpu.attachment = attachment;
 	return 0;
 }
