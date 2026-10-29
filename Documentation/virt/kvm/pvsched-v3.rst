@@ -208,6 +208,77 @@ its init and unregisters first in its exit.
 The policy's name and version fix what each kind of boost means, so a guest
 can interpret it without the host's configuration.
 
+External policies
+-----------------
+
+An external policy runs none of the engine above: no baseline, budgets,
+cutoff, host reasons or tickets.  A module registers a set of ops with
+``pvsched_register_external_policy()`` (``include/linux/pvsched_external.h``),
+under a name and version in the same namespace as other policies, and pvsched
+calls them at each event.  ``QUERY_POLICY`` lists it with the CUSTOM protocol
+and no parameters, and a VMM selects it with ``SET_POLICY`` as any other; the
+same pinning and unregistration rules apply.
+
+pvsched keeps the shared page, its negotiation and pinning, the attachment's
+lifetime, lookups and checks (task exit, the vCPU binding, the position and
+the execution mode), and owns only the 64-byte header.  Bytes 64 through 4095
+belong to the policy and its guest side, which define their layout;
+pvsched neither reads nor writes them, nor clears them at detach.
+
+Every op is optional and gets ``struct pvsched_vcpu``: the vCPU thread, its
+area, KVM's ``vcpu_id`` (-1 before the vCPU's first KVM event), KVM's mode
+flags for the event, the vCPU's position, and ``priv``.  pvsched keeps no state for the policy: ``priv`` is NULL until
+``attach`` sets it, is carried to every later op, and is the policy's to free
+in ``detach``.
+
+* ``attach`` runs once negotiation succeeded, with the page pinned and before
+  any event can reach the vCPU, in process context with the session mutex
+  held.  A module may sleep there, but must not call back into pvsched for
+  the same session.  A negative errno fails the ATTACH.
+* ``detach`` runs exactly once after a successful ``attach``, in process
+  context: at teardown (DETACH, close, or the cleanup after task exit, a
+  binding failure or an unsupported mode), once the attachment is disabled,
+  the guest was told DISABLED and no other op can run; or, if publication
+  fails after ``attach``, before the preparation is discarded.  No op runs
+  after it.  Its ``exited`` argument says the task is exiting or gone.
+* ``run_enter``, ``run_leave``, ``vmentry``, ``vmentry_cancel``,
+  ``vmexit_irqoff``, ``vmexit``, ``halt``, ``unhalt`` and ``inject`` map one
+  to one onto the KVM boundaries below.  ``vmexit`` runs on slow exits only;
+  ``vmentry`` on every entry, including a fast re-entry, and
+  ``vmexit_irqoff`` once per exit from KVM's run loop, so several
+  ``vmentry`` calls may precede one ``vmexit_irqoff``.
+
+Every op but ``attach`` runs under the attachment's raw spinlock with IRQs
+off, so the ops of one vCPU never overlap.  They must not sleep and may take
+only locks that order after the task's ``pi_lock`` and runqueue lock.  A
+policy may change the vCPU thread's scheduling, and only its, with
+``sched_setattr_nocheck_nopi()``, but never in ``vmentry`` or
+``vmexit_irqoff``.  ``detach`` is where it restores what it changed, as the
+managed engine restores its baseline at the same point, unless ``exited``.
+
+``inject`` reaches every attachment whose mode at injection is supported, in
+any position; nesting is reported in the mode flags and left to the policy.
+An injection from a source in guest mode is run from hard irq_work on the
+target's CPU, coalesced as for the default policy, except into a target that
+is running guest code, where it runs on the injecting CPU.  Only that last
+call has ``source_guest_mode`` set, and there the policy must not change
+scheduling.  Deferred injections that arrive before the work runs become
+one call, with the mode of the latest, so ``inject`` does not count
+interrupts.
+
+A policy reaches the area only through helpers that take the ``v`` an op was
+called with, in whole aligned words: ``pvsched_area_read()`` and
+``pvsched_area_write()`` copy a block, and ``pvsched_area_read_u64()`` and
+``pvsched_area_write_u64()`` move one word without a buffer.  Any op may read.
+Writes are allowed only from ``vmexit``, ``vmentry`` and ``detach``: pvsched
+marks the area writable around those under the attachment's lock and refuses a
+write from any other op.  Between ``vmexit`` and ``vmentry`` the vCPU runs no
+guest code, so the guest sees the words whole when it resumes.  ``inject`` may
+not write, as it may run while the guest does.  ``detach`` may scrub the
+words.  Everything the guest wrote is untrusted input.  An unsupported
+execution mode revokes the attachment as for other policies, and
+``QUERY_RUNNER`` reports ``EOPNOTSUPP``.
+
 Runner control ABI
 ==================
 
@@ -453,7 +524,8 @@ their guest-area protocol when they are registered.  A guest may only request
 the policy its VMM selected for the session: any other name is
 ``UNKNOWN_POLICY``, and another version ``POLICY_VERSION_MISMATCH``.  After
 the framework's own checks, the policy's optional ``negotiate`` callback may
-refuse the request with ``DISABLED``.
+refuse the request with ``DISABLED``.  An external policy requires the CUSTOM
+protocol and POLICY mode, and its response writes the header only.
 An enabled status is meaningful only after all requested values match the
 host-authorized selection.
 
@@ -543,9 +615,9 @@ In the default protocol, bytes 192 through 4095 are extension storage and
 must be zero.  The custom protocol has none of the layout above: every byte
 after the header, ``PVSCHED_OPAQUE_SIZE`` bytes at ``PVSCHED_OPAQUE_OFFSET``
 (``opaque`` in ``union pvsched_vcpu_page``), belongs to the policy and its
-guest side, which define their layout, ownership and validation.  The common
-header never becomes policy storage.  No vCPU-placement ABI is reserved
-speculatively.
+guest side, which define their layout, ownership and validation.  External
+policies use it.  The common header never becomes policy storage.  No
+vCPU-placement ABI is reserved speculatively.
 
 Guest core and PCI transport
 ============================
@@ -574,6 +646,17 @@ the running task without a switch, and stale pending hints are not yet
 published.  ``pvsched_guest.allow=`` lists the host policies the guest accepts
 (``*`` by default).
 
+A guest serves one host policy, chosen when the kernel is built.  Instead of
+the default protocol, it can carry the guest side of one external policy,
+built in so that it exists before a transport probes.  The core keeps its
+``sched_switch`` probe and interrupt hook and calls the guest external
+policy's directly, with that policy's part of the page; it negotiates only for
+the policy's name and version, with the CUSTOM protocol and POLICY mode, and
+stays inert against a host advertising any other policy.
+``CONFIG_PVSCHED_GUEST_RECORD`` is an example, paired with the ``record``
+selftest module: the guest counts context switches and hardirq events, and
+the host records them without scheduling anything.
+
 ``CONFIG_PVSCHED_GUEST_PCI`` carries the pages to the VMM through the pvsched
 PCI device (``include/uapi/linux/pvsched_pci.h``).  The driver writes one
 ``{apic_id, gpa}`` entry per vCPU into the BAR1 table and rings the BAR0
@@ -587,8 +670,9 @@ exit is itself the event.
 Runtime scope
 =============
 
-Not covered yet: BPF policies, custom guest-area protocols, policy-managed
-enforcement, vCPU placement, migration (a VMM
+Not covered yet: BPF policies, managed policies with a custom guest-area
+protocol, policy-managed enforcement for managed policies, vCPU placement,
+migration (a VMM
 must block it while pages are attached), confidential guests, and
 architectures other than x86-64.  The representation in
 ``include/uapi/linux/pvsched.h`` alone provides no atomic publication, input
