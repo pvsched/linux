@@ -122,19 +122,25 @@ struct pvsched_set_policy {
 					 PVSCHED_HOST_AREA_SIZE)
 #define PVSCHED_EXTENSION_SIZE		(PVSCHED_VCPU_STRIDE - \
 					 PVSCHED_FIXED_SIZE)
+/* The custom protocol's part of the page: everything after the header. */
+#define PVSCHED_OPAQUE_OFFSET		PVSCHED_COMMON_HEADER_SIZE
+#define PVSCHED_OPAQUE_SIZE		(PVSCHED_VCPU_STRIDE - \
+					 PVSCHED_OPAQUE_OFFSET)
 
 #define PVSCHED_DEFAULT_POLICY_NAME	"default"
 #define PVSCHED_DEFAULT_POLICY_VERSION	1
 
 /*
- * Each vCPU page contains a common negotiation header, a guest area, common
- * host feedback, and extension storage.  A custom policy can use the default
- * guest area or define its own.  The framework publishes the
- * common applied state in FRAMEWORK mode; the policy publishes it in POLICY
- * mode.  The built-in default policy uses the default guest area, publishes
- * its interrupt ticket in the default host area, and writes the remaining
- * reserved host and extension storage as zero.  A custom policy defines the
- * ownership and validation of the custom storage it uses.
+ * Each vCPU page starts with a common negotiation header; the negotiated
+ * protocol defines the rest.  The default protocol has a guest area, host
+ * feedback and extension storage.  The framework publishes its applied
+ * state in FRAMEWORK mode; the policy publishes it in POLICY mode.  The
+ * built-in default policy uses the default guest area, publishes its
+ * interrupt ticket in the host feedback, and writes the remaining reserved
+ * host and extension storage as zero.  The custom protocol leaves
+ * everything after the header, PVSCHED_OPAQUE_SIZE bytes at
+ * PVSCHED_OPAQUE_OFFSET, to the policy and its guest side, which define
+ * its layout, ownership and validation.
  */
 
 enum pvsched_status {
@@ -230,7 +236,6 @@ struct pvsched_default_guest_area {
 
 union pvsched_guest_area {
 	struct pvsched_default_guest_area default_area;
-	__u8 custom[PVSCHED_GUEST_AREA_SIZE];
 };
 
 enum pvsched_hint {
@@ -271,39 +276,42 @@ union pvsched_applied_state {
 };
 
 /*
- * Common host feedback, bytes 128..191.  The host publishes applied_state as
- * a coherent snapshot immediately before committed VMENTRY; it is not a live
- * asynchronous view.  The framework writes it in FRAMEWORK mode and the
- * policy writes it in POLICY mode.  Framework throttle flags are zero in
- * POLICY mode.  The default protocol uses the next word for interrupt_ticket;
- * a custom protocol owns all 56 bytes after applied_state.
+ * Host feedback of the default protocol, bytes 128..191.  The host publishes
+ * applied_state as a coherent snapshot immediately before committed
+ * VMENTRY; it is not a live asynchronous view.  The framework writes it in
+ * FRAMEWORK mode and the policy writes it in POLICY mode.  Framework
+ * throttle flags are zero in POLICY mode.  The next word is
+ * interrupt_ticket.
  */
 struct pvsched_host_area {
 	union pvsched_applied_state applied_state;
-	union {
-		struct {
-			/* Default protocol only; zero means no outstanding ticket. */
-			__aligned_le64 interrupt_ticket;
-			__u8 reserved[48];
-		} default_area;
-		__u8 custom[56];
-	};
+	struct {
+		/* Zero means no outstanding ticket. */
+		__aligned_le64 interrupt_ticket;
+		__u8 reserved[48];
+	} default_area;
 };
 
 /*
- * One page per vCPU.  Default and custom guest-area protocols share the common
- * header and host feedback.  The custom guest area is the 64 bytes at
- * offset 64; policy-specific extension storage begins at byte 192.  The C
- * type has 8-byte alignment, while its backing page must be 4096-byte aligned.
- * The sections at offsets 0, 64, and 128 then occupy distinct 64-byte
- * cachelines.
+ * One page per vCPU: the common header, then either the default protocol's
+ * guest area, host feedback and extension storage, or the custom protocol's
+ * opaque bytes.  The C type has 8-byte alignment, while its backing page
+ * must be 4096-byte aligned.  The sections at offsets 0, 64, and 128 then
+ * occupy distinct 64-byte cachelines.
  */
 union pvsched_vcpu_page {
 	struct {
 		struct pvsched_header header;
-		union pvsched_guest_area guest_area;
-		struct pvsched_host_area host_area;
-		__u8 extension[PVSCHED_EXTENSION_SIZE];
+		union {
+			/* PVSCHED_PROTOCOL_DEFAULT */
+			struct {
+				union pvsched_guest_area guest_area;
+				struct pvsched_host_area host_area;
+				__u8 extension[PVSCHED_EXTENSION_SIZE];
+			};
+			/* PVSCHED_PROTOCOL_CUSTOM */
+			__u8 opaque[PVSCHED_OPAQUE_SIZE];
+		};
 	};
 	__u8 raw[PVSCHED_VCPU_STRIDE];
 };

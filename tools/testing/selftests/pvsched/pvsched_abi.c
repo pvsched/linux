@@ -96,8 +96,6 @@ _Static_assert(offsetof(struct pvsched_set_policy, version) == 32,
 
 _Static_assert(offsetof(struct pvsched_host_area, applied_state) == 0,
 		       "applied offset");
-_Static_assert(offsetof(struct pvsched_host_area, custom) == 8,
-		       "host custom offset");
 _Static_assert(offsetof(struct pvsched_host_area, default_area.interrupt_ticket) == 8,
 		       "interrupt ticket offset");
 _Static_assert(offsetof(struct pvsched_host_area, default_area.reserved) == 16,
@@ -112,6 +110,9 @@ _Static_assert(offsetof(union pvsched_vcpu_page, host_area) == 128,
 		       "host area page offset");
 _Static_assert(offsetof(union pvsched_vcpu_page, extension) == 192,
 		       "extension page offset");
+_Static_assert(offsetof(union pvsched_vcpu_page, opaque) == 64 &&
+	       PVSCHED_OPAQUE_OFFSET == 64 && PVSCHED_OPAQUE_SIZE == 4032,
+		       "opaque page offset");
 _Static_assert(_Alignof(union pvsched_vcpu_page) >= 8,
 		       "page alignment");
 _Static_assert(sizeof(struct pvsched_info) == 32, "info size");
@@ -236,7 +237,7 @@ int main(void)
 	      "aligned le64 width and alignment");
 	check(offsetof(union pvsched_vcpu_page, guest_area.default_area.interrupt_ack) == 80 &&
 	      offsetof(union pvsched_vcpu_page, host_area.default_area.interrupt_ticket) == 136 &&
-	      sizeof(host.default_area) == sizeof(host.custom),
+	      sizeof(host.default_area) == 56,
 	      "default ack and ticket overlay layout");
 	check(_IOC_DIR(PVSCHED_GET_INFO) == _IOC_READ &&
 	      _IOC_SIZE(PVSCHED_GET_INFO) == sizeof(struct pvsched_info) &&
@@ -412,15 +413,15 @@ int main(void)
 		      "unknown applied flags, boost and reserved fixture");
 	}
 	{
-		unsigned char applied_before[8];
+		unsigned char header_before[64];
 
-		memcpy(applied_before, &host.applied_state, sizeof(applied_before));
-		memset(host.custom, 0xa5, sizeof(host.custom));
-		check(host.custom[0] == 0xa5 && host.custom[55] == 0xa5,
-		      "custom protocol host view covers ticket overlay");
-		check(!memcmp(applied_before, &host.applied_state,
-			      sizeof(applied_before)),
-		      "host custom independent of applied state");
+		memcpy(header_before, &page.header, sizeof(header_before));
+		memset(page.opaque, 0xa5, sizeof(page.opaque));
+		check(page.raw[PVSCHED_OPAQUE_OFFSET] == 0xa5 &&
+		      page.raw[PVSCHED_VCPU_STRIDE - 1] == 0xa5,
+		      "custom protocol opaque bytes reach the page end");
+		check(!memcmp(header_before, &page.header, sizeof(header_before)),
+		      "opaque bytes independent of the header");
 	}
 	check(sizeof(((union pvsched_vcpu_page *)0)->raw) == 4096 &&
 	      PVSCHED_FIXED_SIZE + PVSCHED_EXTENSION_SIZE == PVSCHED_VCPU_STRIDE &&

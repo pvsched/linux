@@ -106,8 +106,8 @@ static void pvsched_shm_bridge_response_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, !memchr_inv(page->extension, 0,
 					    sizeof(page->extension)));
 	KUNIT_EXPECT_EQ(test, le32_to_cpu(page->header.abi_version), 0x5a5a5a5aU);
-	KUNIT_EXPECT_TRUE(test, !memchr_inv(page->guest_area.custom, 0x5a,
-					    sizeof(page->guest_area.custom)));
+	KUNIT_EXPECT_TRUE(test, !memchr_inv(&page->guest_area, 0x5a,
+					    sizeof(page->guest_area)));
 }
 
 static void pvsched_shm_bridge_status_test(struct kunit *test)

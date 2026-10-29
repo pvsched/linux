@@ -502,20 +502,17 @@ and RR with nice zero and RT priority 1 through 99, and IDLE and DEADLINE with
 zero nice and RT priority.  EXT and unknown policies are invalid for this
 protocol version.
 
-A custom guest-area protocol owns bytes 64 through 127 and interprets them
-according to its policy identity and version.
-
 Common host feedback
 --------------------
 
-Bytes 128 through 191 are common host feedback.  ``applied_state`` atomically
-reports the kind of boost the host successfully applied, a deboost
-notification hint, and framework CS/total-throttle flags.  It is written by the
-framework in framework-managed mode and by the policy in policy-managed mode.
-The writer publishes this coherent snapshot immediately before a committed
-VMENTRY.  It describes the applied state for that entry, not live asynchronous
-state between entries.  Both framework throttle flags are zero in
-policy-managed mode.
+In the default protocol, bytes 128 through 191 are host feedback.
+``applied_state`` atomically reports the kind of boost the host successfully
+applied, a deboost notification hint, and framework CS/total-throttle flags.
+It is written by the framework in framework-managed mode and by the policy in
+policy-managed mode.  The writer publishes this coherent snapshot immediately
+before a committed VMENTRY.  It describes the applied state for that entry, not
+live asynchronous state between entries.  Both framework throttle flags are
+zero in policy-managed mode.
 
 ``boost`` is ``PVSCHED_BOOST_BASELINE`` (not elevated, or a deboost),
 ``PVSCHED_BOOST_TASK`` (elevated for guest task intent) or
@@ -535,23 +532,20 @@ host-owned generation that requests the guest acknowledgment described
 above.  The ticket is an interrupt-handoff token, not proof that FIFO was
 applied or that a handler ran.  Bytes 144 through 191 are reserved and zero.
 
-The default-protocol view overlays the first eight bytes of the 56-byte custom
-host region after ``applied_state``.  A custom protocol retains ownership and
-validation of all 56 bytes and need not interpret them as a ticket.
-
 Interrupt acceptance, preparation, wakeup, guest entry, and handler service are
 different events.  The ABI does not claim that any host status proves interrupt
 service.
 
-Extension storage
------------------
+Extension and opaque storage
+----------------------------
 
-Bytes 192 through 4095 are policy-specific extension storage.  The default
-guest-area protocol requires them to be zero.  A custom policy defines their
-ownership and validation.  The common header and ``applied_state`` never become
-opaque policy storage; the custom guest area, custom host-feedback bytes,
-and extension storage are the policy-defined regions.  No vCPU-placement ABI
-is reserved speculatively.
+In the default protocol, bytes 192 through 4095 are extension storage and
+must be zero.  The custom protocol has none of the layout above: every byte
+after the header, ``PVSCHED_OPAQUE_SIZE`` bytes at ``PVSCHED_OPAQUE_OFFSET``
+(``opaque`` in ``union pvsched_vcpu_page``), belongs to the policy and its
+guest side, which define their layout, ownership and validation.  The common
+header never becomes policy storage.  No vCPU-placement ABI is reserved
+speculatively.
 
 Guest core and PCI transport
 ============================
