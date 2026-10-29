@@ -25,6 +25,7 @@
 
 #include "attachment.h"
 #include "lifecycle.h"
+#include "policy.h"
 #include "shm_bridge.h"
 
 #define PVSCHED_ATTACHMENT_HASH_BITS 8
@@ -279,6 +280,29 @@ bool pvsched_attachment_mark_exited(struct task_struct *task,
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_attachment_mark_exited);
 
+/*
+ * Whether the target vCPU takes an injection in @target_mode_flags.  An
+ * external policy decides for itself, in any position and nested or not,
+ * but is never called for an injection in an unsupported mode.  A managed
+ * policy needs a supported, not nested mode, both at injection and as the
+ * target vCPU last reported it, and the target vCPU waiting in the host:
+ * runnable or halted.
+ */
+static bool pvsched_attachment_inject_ok(const struct pvsched_attachment *attachment,
+					 u32 target_mode_flags)
+{
+	const u32 refused = PVSCHED_RUNNER_MODE_NESTED |
+			    PVSCHED_RUNNER_MODE_UNSUPPORTED;
+
+	if (attachment->external)
+		return !(target_mode_flags & PVSCHED_RUNNER_MODE_UNSUPPORTED);
+	return !(target_mode_flags & refused) &&
+	       attachment->target_mode_valid &&
+	       !(attachment->target_mode_flags & refused) &&
+	       (attachment->position == PVSCHED_RUNNER_HOST ||
+		attachment->position == PVSCHED_RUNNER_BLOCKED);
+}
+
 unsigned int pvsched_attachment_remote_visit(const void *vcpu_key,
 					     u32 target_mode_flags,
 					      pvsched_attachment_visit_fn visit,
@@ -289,7 +313,10 @@ unsigned int pvsched_attachment_remote_visit(const void *vcpu_key,
 	unsigned long flags;
 	unsigned int visited = 0;
 
-	if (!vcpu_key ||
+	if (!vcpu_key)
+		return 0;
+	/* Without an external policy, no attachment takes these. */
+	if (!static_branch_unlikely(&pvsched_external_policies) &&
 	    (target_mode_flags & (PVSCHED_RUNNER_MODE_NESTED |
 				  PVSCHED_RUNNER_MODE_UNSUPPORTED)))
 		return 0;
@@ -303,12 +330,7 @@ unsigned int pvsched_attachment_remote_visit(const void *vcpu_key,
 		attachment = binding->attachment;
 		raw_spin_lock_irqsave(&attachment->state_lock, flags);
 		if (attachment->active &&
-		    attachment->target_mode_valid &&
-		    !(attachment->target_mode_flags &
-		      (PVSCHED_RUNNER_MODE_NESTED |
-		       PVSCHED_RUNNER_MODE_UNSUPPORTED)) &&
-		    (attachment->position == PVSCHED_RUNNER_HOST ||
-		     attachment->position == PVSCHED_RUNNER_BLOCKED)) {
+		    pvsched_attachment_inject_ok(attachment, target_mode_flags)) {
 			if (visit)
 				visit(attachment, PVSCHED_ATTACHMENT_VISIT_ORDINARY,
 				      data);

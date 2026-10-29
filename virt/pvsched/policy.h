@@ -2,6 +2,7 @@
 #ifndef _VIRT_PVSCHED_POLICY_H
 #define _VIRT_PVSCHED_POLICY_H
 
+#include <linux/jump_label.h>
 #include <linux/list.h>
 #include <linux/pvsched_external.h>
 #include <linux/pvsched_policy.h>
@@ -54,6 +55,13 @@ pvsched_policy_params_size(const struct pvsched_policy_entry *entry)
 {
 	return entry->ops ? entry->ops->params_size : 0;
 }
+
+/*
+ * Enabled while any external policy entry exists, registered or still
+ * pinned by a session: only then may an injection into a nested target, or
+ * one in an unsupported mode, find an attachment that wants it.
+ */
+DECLARE_STATIC_KEY_FALSE(pvsched_external_policies);
 
 /* Nonempty, NUL-terminated, and zero-padded after the terminator. */
 bool pvsched_policy_name_valid(const char *name);

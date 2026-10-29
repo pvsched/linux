@@ -256,7 +256,7 @@ static int pvsched_runner_test_thread(void *data)
 			ctx->command_ret = pvsched_runner_local_event(
 				ctx->command_key, ctx->command_event,
 				ctx->command_mode_flags, ctx->command_is_vmentry,
-				ctx->command_interrupt_ready);
+				ctx->command_interrupt_ready, NULL);
 		else if (ctx->command == PVSCHED_TEST_COMMAND_SPIN) {
 			complete(&ctx->spin_started);
 			while (!completion_done(&ctx->spin_release))
@@ -1404,7 +1404,7 @@ static void pvsched_runner_local_inject_refused_without_mutation_test(struct kun
 	memcpy(&applied, ctx->runtime.applied, sizeof(applied));
 	reasons = ctx->runtime.reasons;
 	KUNIT_EXPECT_EQ(test, pvsched_runner_local_event(&key,
-		PVSCHED_RECONCILE_INJECT, 0, false, false), -EINVAL);
+		PVSCHED_RECONCILE_INJECT, 0, false, false, NULL), -EINVAL);
 	KUNIT_EXPECT_EQ(test, ctx->runtime.attachment.position,
 			PVSCHED_RUNNER_VMM);
 	KUNIT_EXPECT_EQ(test, ctx->runtime.accounting.anchor.wall_ns,
@@ -1428,7 +1428,7 @@ static void pvsched_runner_guest_source_inject_uses_hard_work_test(struct kunit 
 		PVSCHED_RECONCILE_RUN_ENTER, 0, false, false), 0);
 	KUNIT_EXPECT_TRUE(test, irq_work_is_hard(&ctx->runtime.inject_work));
 	pvsched_runner_test_start_spin(ctx);
-	visited = pvsched_runner_remote_inject(&key, 0, true);
+	visited = pvsched_runner_remote_inject(&key, 0, 0, true);
 	irq_work_sync(&ctx->runtime.inject_work);
 	pvsched_runner_test_stop_spin(ctx);
 	KUNIT_EXPECT_EQ(test, visited, 1U);

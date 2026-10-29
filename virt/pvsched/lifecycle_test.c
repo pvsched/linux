@@ -109,7 +109,7 @@ static void pvsched_lifecycle_test_owner_visit(struct task_struct *task,
 	struct pvsched_lifecycle_test_state *state = test->priv;
 
 	state->visit_ret = pvsched_runner_local_event(&state->visit_key,
-		PVSCHED_RECONCILE_CANCEL, 0, false, false);
+		PVSCHED_RECONCILE_CANCEL, 0, false, false, NULL);
 	task_lock(task);
 	*mm = task->mm;
 	*tgid = task_tgid(task);

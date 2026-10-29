@@ -8,7 +8,9 @@
 #include "shm.h"
 
 /*
- * The bridge is the only code that reads or writes the pinned shared page.
+ * The bridge is the only pvsched code that reads or writes the pinned shared
+ * page, except an external policy's part of it, which pvsched leaves to the
+ * policy, which reads and writes it through the pvsched_area_*() helpers.
  * Every shared word is accessed whole and aligned; guest-owned words are
  * copied into caller storage and never interpreted in place.  None of these
  * helpers validates guest input.

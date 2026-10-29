@@ -31,6 +31,18 @@ struct pvsched_runner_vmentry_input {
 	bool interrupt_ready;
 };
 
+/*
+ * KVM's own data about a target-local event, which only external policies
+ * see: the raw KVM_PVSCHED_MODE_* flags, KVM's vcpu_id and, for RUN_LEAVE,
+ * what KVM_RUN returns.
+ */
+struct pvsched_runner_kvm_info {
+	u32 kvm_mode;
+	s32 vcpu_id;
+	int run_ret;
+	u32 exit_reason;
+};
+
 /* Owned by the persistent runner, rather than an attachment runtime. */
 struct pvsched_ticket_owner {
 	u64 last_ticket;
@@ -80,6 +92,8 @@ struct pvsched_runner_runtime {
 	struct irq_work inject_work;
 	/* Mode snapshot coalesced for the pending injection work. */
 	u32 inject_mode_flags;
+	/* Its raw KVM flags, for an external policy. */
+	u32 inject_kvm_mode;
 	/* Latest owned-fault errno; external ownership does not set it. */
 	int last_fault;
 	/*
@@ -198,15 +212,22 @@ int pvsched_runner_reconcile(struct pvsched_runner_runtime *runtime,
 			     enum pvsched_reconcile_event event,
 			     const struct pvsched_runner_event_input *input);
 
-/* Apply or defer one vCPU-keyed remote injection fact. */
+/*
+ * Apply or defer one vCPU-keyed remote injection fact.  @kvm_mode is the
+ * raw form of @mode_flags.
+ */
 unsigned int pvsched_runner_remote_inject(const void *vcpu_key,
-					  u32 mode_flags,
+					  u32 mode_flags, u32 kvm_mode,
 					  bool source_guest_mode);
-/* Target-local adapters that find the runtime by its vCPU key. */
+/*
+ * Target-local adapters that find the runtime by its vCPU key.  @info may
+ * be NULL where no external policy needs them.
+ */
 int pvsched_runner_local_event(const void *vcpu_key,
 			       enum pvsched_reconcile_event event,
 			       u32 mode_flags, bool vmentry,
-			       bool interrupt_ready);
+			       bool interrupt_ready,
+			       const struct pvsched_runner_kvm_info *info);
 void pvsched_runner_local_guest_exit_irqoff(const void *vcpu_key);
 
 /**

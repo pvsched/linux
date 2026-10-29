@@ -1012,8 +1012,20 @@ EXPORT_SYMBOL_IF_KUNIT(pvsched_runner_vmentry);
 
 struct pvsched_runner_remote_inject_ctx {
 	u32 mode_flags;
+	u32 kvm_mode;
 	bool source_guest_mode;
 };
+
+/* Run the injection on the target's CPU, after its guest state is unloaded. */
+static void pvsched_runner_queue_inject(struct pvsched_runner_runtime *runtime)
+{
+	int cpu = task_cpu(runtime->attachment.task);
+
+	if (cpu != smp_processor_id() && cpu_online(cpu))
+		irq_work_queue_on(&runtime->inject_work, cpu);
+	else
+		irq_work_queue(&runtime->inject_work);
+}
 
 static void
 pvsched_runner_remote_inject_visit(struct pvsched_attachment *attachment,
@@ -1026,13 +1038,29 @@ pvsched_runner_remote_inject_visit(struct pvsched_attachment *attachment,
 	struct pvsched_runner_event_input input = {
 		.mode_flags = ctx->mode_flags,
 	};
-	int cpu;
 
 	if (kind != PVSCHED_ATTACHMENT_VISIT_ORDINARY)
 		return;
-	/* Disabled until the external policy's ops are plugged in. */
-	if (attachment->external)
+	if (attachment->external) {
+		if (!pvsched_external_wants_inject(runtime))
+			return;
+		/*
+		 * Defer, as for a managed policy, so that the policy may change
+		 * scheduling.  A target running guest code is called at once
+		 * instead: queueing work on its CPU would force a VM exit, and
+		 * it already runs and will take the interrupt itself.
+		 */
+		if (ctx->source_guest_mode &&
+		    attachment->position != PVSCHED_RUNNER_GUEST) {
+			runtime->inject_mode_flags = ctx->mode_flags;
+			runtime->inject_kvm_mode = ctx->kvm_mode;
+			pvsched_runner_queue_inject(runtime);
+		} else {
+			pvsched_external_inject_locked(runtime, ctx->kvm_mode,
+						       ctx->source_guest_mode);
+		}
 		return;
+	}
 	if (attachment->position == PVSCHED_RUNNER_HOST &&
 	    !task_is_runnable(attachment->task))
 		return;
@@ -1044,19 +1072,16 @@ pvsched_runner_remote_inject_visit(struct pvsched_attachment *attachment,
 	if (!task_is_runnable(attachment->task))
 		return;
 	runtime->inject_mode_flags = ctx->mode_flags;
-	cpu = task_cpu(attachment->task);
-	if (cpu != smp_processor_id() && cpu_online(cpu))
-		irq_work_queue_on(&runtime->inject_work, cpu);
-	else
-		irq_work_queue(&runtime->inject_work);
+	pvsched_runner_queue_inject(runtime);
 }
 
 unsigned int pvsched_runner_remote_inject(const void *vcpu_key,
-					  u32 mode_flags,
+					  u32 mode_flags, u32 kvm_mode,
 					  bool source_guest_mode)
 {
 	struct pvsched_runner_remote_inject_ctx ctx = {
 		.mode_flags = mode_flags,
+		.kvm_mode = kvm_mode,
 		.source_guest_mode = source_guest_mode,
 	};
 
@@ -1073,6 +1098,20 @@ static void pvsched_runner_inject_work(struct irq_work *work)
 	unsigned long flags;
 
 	raw_spin_lock_irqsave(&runtime->attachment.state_lock, flags);
+	if (runtime->attachment.external) {
+		/*
+		 * Only service and the mode at injection are rechecked.  The
+		 * source has left guest mode by now, so the policy is told it
+		 * may change scheduling here.
+		 */
+		if (runtime->attachment.active &&
+		    !(runtime->inject_mode_flags &
+		      PVSCHED_RUNNER_MODE_UNSUPPORTED))
+			pvsched_external_inject_locked(runtime,
+						       runtime->inject_kvm_mode,
+						       false);
+		goto unlock;
+	}
 	if (!runtime->attachment.active ||
 	    !runtime->attachment.target_mode_valid ||
 	    (runtime->attachment.target_mode_flags &
@@ -1096,6 +1135,7 @@ struct pvsched_runner_local_event_ctx {
 	u32 mode_flags;
 	bool vmentry;
 	bool interrupt_ready;
+	const struct pvsched_runner_kvm_info *kvm;
 	int ret;
 };
 
@@ -1116,8 +1156,16 @@ pvsched_runner_local_event_visit(struct pvsched_attachment *attachment,
 	bool published = false;
 
 	if (attachment->external) {
-		pvsched_external_local_event_locked(runtime, kind,
-						    ctx->mode_flags);
+		struct pvsched_external_event event = {
+			.event = ctx->vmentry ?
+				 PVSCHED_EXTERNAL_RECONCILE_VMENTRY :
+				 (enum pvsched_external_reconcile_event)ctx->event,
+			.mode_flags = ctx->mode_flags,
+			.interrupt_ready = ctx->interrupt_ready,
+			.kvm = ctx->kvm,
+		};
+
+		pvsched_external_local_event_locked(runtime, kind, &event);
 		ctx->ret = 0;
 		return;
 	}
@@ -1178,13 +1226,15 @@ pvsched_runner_local_event_visit(struct pvsched_attachment *attachment,
 int pvsched_runner_local_event(const void *vcpu_key,
 			       enum pvsched_reconcile_event event,
 			       u32 mode_flags, bool vmentry,
-			       bool interrupt_ready)
+			       bool interrupt_ready,
+			       const struct pvsched_runner_kvm_info *info)
 {
 	struct pvsched_runner_local_event_ctx ctx = {
 		.event = event,
 		.mode_flags = mode_flags,
 		.vmentry = vmentry,
 		.interrupt_ready = interrupt_ready,
+		.kvm = info,
 		.ret = -ENOENT,
 	};
 	enum pvsched_runner_position position;
@@ -1213,10 +1263,15 @@ pvsched_runner_guest_exit_irqoff_visit(struct pvsched_attachment *attachment,
 	struct pvsched_runner_runtime *runtime =
 		container_of(attachment, struct pvsched_runner_runtime, attachment);
 
-	/* Disabled until the external policy's ops are plugged in. */
-	if (attachment->external)
-		return;
-	pvsched_runner_guest_exit_irqoff(runtime);
+	if (attachment->external) {
+		struct pvsched_external_event event = {
+			.event = PVSCHED_EXTERNAL_RECONCILE_VMEXIT_IRQOFF,
+		};
+
+		pvsched_external_local_event_locked(runtime, kind, &event);
+	} else {
+		pvsched_runner_guest_exit_irqoff(runtime);
+	}
 }
 
 void pvsched_runner_local_guest_exit_irqoff(const void *vcpu_key)

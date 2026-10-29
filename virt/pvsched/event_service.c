@@ -41,25 +41,44 @@ VISIBLE_IF_KUNIT u32 pvsched_mode_flags(u32 flags)
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_mode_flags);
 
+/* KVM's own data about the event, which only an external policy sees. */
+static struct pvsched_runner_kvm_info
+pvsched_kvm_info(const struct kvm_vcpu *vcpu, u32 flags)
+{
+	return (struct pvsched_runner_kvm_info) {
+		.kvm_mode = flags,
+		.vcpu_id = vcpu->vcpu_id,
+	};
+}
+
 static void pvsched_run_enter(void *unused, struct kvm_vcpu *vcpu, u32 flags)
 {
+	struct pvsched_runner_kvm_info info = pvsched_kvm_info(vcpu, flags);
+
 	pvsched_runner_local_event(vcpu, PVSCHED_RECONCILE_RUN_ENTER,
-				   pvsched_mode_flags(flags), false, false);
+				   pvsched_mode_flags(flags), false, false,
+				   &info);
 }
 
 static void pvsched_run_leave(void *unused, struct kvm_vcpu *vcpu, int ret,
 			      u32 exit_reason)
 {
+	struct pvsched_runner_kvm_info info = pvsched_kvm_info(vcpu, 0);
+
+	info.run_ret = ret;
+	info.exit_reason = exit_reason;
 	pvsched_runner_local_event(vcpu, PVSCHED_RECONCILE_RUN_LEAVE, 0,
-				   false, false);
+				   false, false, &info);
 }
 
 static void pvsched_vmentry(void *unused, struct kvm_vcpu *vcpu, u32 flags,
 			    bool interrupt_ready)
 {
+	struct pvsched_runner_kvm_info info = pvsched_kvm_info(vcpu, flags);
+
 	pvsched_runner_local_event(vcpu, PVSCHED_RECONCILE_CANCEL,
 				   pvsched_mode_flags(flags), true,
-				   interrupt_ready);
+				   interrupt_ready, &info);
 }
 
 static void pvsched_vmexit_irqoff(void *unused, struct kvm_vcpu *vcpu)
@@ -70,37 +89,47 @@ static void pvsched_vmexit_irqoff(void *unused, struct kvm_vcpu *vcpu)
 static void pvsched_vmexit(void *unused, struct kvm_vcpu *vcpu, u32 flags,
 			   bool hlt_exit)
 {
+	struct pvsched_runner_kvm_info info = pvsched_kvm_info(vcpu, flags);
 	u32 mode = pvsched_mode_flags(flags);
 
 	if (hlt_exit)
 		mode |= PVSCHED_RUNNER_MODE_HLT_EXIT;
 	pvsched_runner_local_event(vcpu, PVSCHED_RECONCILE_VMEXIT, mode,
-				   false, false);
+				   false, false, &info);
 }
 
 static void pvsched_vmentry_cancel(void *unused, struct kvm_vcpu *vcpu,
 				   u32 flags)
 {
+	struct pvsched_runner_kvm_info info = pvsched_kvm_info(vcpu, flags);
+
 	pvsched_runner_local_event(vcpu, PVSCHED_RECONCILE_CANCEL,
-				   pvsched_mode_flags(flags), false, false);
+				   pvsched_mode_flags(flags), false, false,
+				   &info);
 }
 
 static void pvsched_halt(void *unused, struct kvm_vcpu *vcpu, u32 flags)
 {
+	struct pvsched_runner_kvm_info info = pvsched_kvm_info(vcpu, flags);
+
 	pvsched_runner_local_event(vcpu, PVSCHED_RECONCILE_HALT,
-				   pvsched_mode_flags(flags), false, false);
+				   pvsched_mode_flags(flags), false, false,
+				   &info);
 }
 
 static void pvsched_unhalt(void *unused, struct kvm_vcpu *vcpu, u32 flags)
 {
+	struct pvsched_runner_kvm_info info = pvsched_kvm_info(vcpu, flags);
+
 	pvsched_runner_local_event(vcpu, PVSCHED_RECONCILE_UNHALT,
-				   pvsched_mode_flags(flags), false, false);
+				   pvsched_mode_flags(flags), false, false,
+				   &info);
 }
 
 static void pvsched_inject(void *unused, struct kvm_vcpu *vcpu, u32 flags,
 			   bool source_guest_mode)
 {
-	pvsched_runner_remote_inject(vcpu, pvsched_mode_flags(flags),
+	pvsched_runner_remote_inject(vcpu, pvsched_mode_flags(flags), flags,
 				     source_guest_mode);
 }
 

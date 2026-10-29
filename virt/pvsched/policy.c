@@ -20,6 +20,9 @@ static DEFINE_MUTEX(pvsched_policy_mutex);
 static LIST_HEAD(pvsched_policies);
 static struct pvsched_policy_entry *pvsched_default_entry;
 
+DEFINE_STATIC_KEY_FALSE(pvsched_external_policies);
+EXPORT_SYMBOL_IF_KUNIT(pvsched_external_policies);
+
 bool pvsched_policy_name_valid(const char *name)
 {
 	size_t len = strnlen(name, PVSCHED_NAME_MAX);
@@ -53,8 +56,11 @@ EXPORT_SYMBOL_IF_KUNIT(pvsched_policy_entry_get);
 void pvsched_policy_entry_put(struct pvsched_policy_entry *entry)
 {
 	/* The registry's own reference is gone, so the entry is unlisted. */
-	if (refcount_dec_and_test(&entry->ref))
-		kfree(entry);
+	if (!refcount_dec_and_test(&entry->ref))
+		return;
+	if (entry->kind == PVSCHED_POLICY_EXTERNAL)
+		static_branch_dec(&pvsched_external_policies);
+	kfree(entry);
 }
 EXPORT_SYMBOL_IF_KUNIT(pvsched_policy_entry_put);
 
@@ -274,9 +280,13 @@ int __pvsched_register_external_policy(struct pvsched_external_ops *ops,
 	entry->kind = PVSCHED_POLICY_EXTERNAL;
 	entry->ext_ops = ops;
 	entry->owner = owner;
+	/* Before listing: a session may attach right after. */
+	static_branch_inc(&pvsched_external_policies);
 	ret = pvsched_policy_add(entry);
-	if (ret)
+	if (ret) {
+		static_branch_dec(&pvsched_external_policies);
 		kfree(entry);
+	}
 	return ret;
 }
 EXPORT_SYMBOL_GPL(__pvsched_register_external_policy);

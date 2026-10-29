@@ -58,9 +58,12 @@ struct pvsched_vcpu {
  *	task is exiting or gone, so its scheduling must not be touched
  * @run_enter: KVM_RUN starts
  * @run_leave: KVM_RUN returns @ret to the VMM
- * @vmentry: the guest is about to be entered
+ * @vmentry: the guest is about to be entered, on every entry, including
+ *	a fast re-entry after an exit KVM handled with IRQs still off
  * @vmentry_cancel: an entry was cancelled before reaching the guest
- * @vmexit_irqoff: the guest exited; IRQs are still off
+ * @vmexit_irqoff: the guest exited to KVM's run loop; IRQs are still off.
+ *	Fast re-entries are not reported, so several @vmentry calls may
+ *	precede one @vmexit_irqoff
  * @vmexit: a slow exit, before KVM handles it
  * @halt: the vCPU is about to block in a halt
  * @unhalt: the vCPU is runnable again after a halt
@@ -88,6 +91,8 @@ struct pvsched_vcpu {
  * or, when the source was in guest mode and the target is not running
  * guest code, from hard irq_work on the target's CPU; @source_guest_mode
  * is set only in the first case with the source still in guest mode.
+ * Injections deferred to the target's CPU before that call runs are merged
+ * into it, with the mode of the latest, so @inject does not count interrupts.
  *
  * The area, the policy's part of the page, is reached only through the
  * pvsched_area_*() helpers.  Any op may read it.  Writes are allowed only
@@ -129,5 +134,31 @@ int __pvsched_register_external_policy(struct pvsched_external_ops *ops,
 #define pvsched_register_external_policy(ops) \
 	__pvsched_register_external_policy(ops, THIS_MODULE)
 void pvsched_unregister_external_policy(struct pvsched_external_ops *ops);
+
+/*
+ * Copy @size bytes from @buf into @v's area at @off, as whole aligned
+ * words, each single-copy atomic for the guest.  @off and @size are
+ * multiples of 8 within PVSCHED_OPAQUE_SIZE.  Only from the vmexit,
+ * vmentry or detach op, with the @v it was called with.  Returns 0,
+ * -EINVAL for a bad range, or -EPERM from any other op or for a vCPU
+ * without a mapped page.
+ */
+int pvsched_area_write(struct pvsched_vcpu *v, u32 off, const void *buf,
+		       u32 size);
+
+/* As pvsched_area_write(), for the one word at @off. */
+int pvsched_area_write_u64(struct pvsched_vcpu *v, u32 off, u64 val);
+
+/*
+ * Copy @size bytes of @v's area at @off into @buf, from any op, with the
+ * @v it was called with.  Each word is read whole; nothing is consistent
+ * across words.  @off and @size as for pvsched_area_write().  Returns 0,
+ * or -EINVAL for a bad range or -ENOENT for a vCPU without a mapped page,
+ * with @buf zeroed.
+ */
+int pvsched_area_read(struct pvsched_vcpu *v, u32 off, void *buf, u32 size);
+
+/* As pvsched_area_read(), for the one word at @off. */
+int pvsched_area_read_u64(struct pvsched_vcpu *v, u32 off, u64 *val);
 
 #endif /* _LINUX_PVSCHED_EXTERNAL_H */
